@@ -25,6 +25,43 @@ class HealingTriggerSchema(BaseModel):
     metadata: Optional[dict[str, Any]] = None
 
 
+async def fire_telegram_alert(error_context: str, message_text: str) -> None:
+    """🚨 Sends a live notification alert to the configured Telegram channel."""
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
+    if not bot_token or not chat_id:
+        print("⚠️ [Chiron Telegram] Alert skipped: Credentials missing in environment.")
+        return
+
+    clean_context = error_context.replace("\r", "").strip()
+    clean_msg = message_text.replace("\r", "").strip()
+
+    # Markdown-formatted notification for Telegram
+    formatted_text = (
+        f"🩺 **CHIRON GITOPS UPDATE**\n\n"
+        f"📅 **Timestamp:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"💡 **Context:** {clean_context}\n"
+        f"📝 **Details:**\n{clean_msg}\n\n"
+        f"⚙️ **Environment:** Production (Chiron Engine)"
+    )
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": formatted_text, "parse_mode": "Markdown"}
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, json=payload)
+            if resp.status_code == 200:
+                print("📨 [Chiron Telegram] Notification pushed successfully.")
+            else:
+                print(
+                    f"⚠️ [Chiron Telegram] Rejected dispatch: {resp.status_code} - {resp.text}"
+                )
+    except Exception as e:
+        print(f"❌ [Chiron Telegram] Connection failure to Telegram API: {e}")
+
+
 async def send_telemetry_log(
     log_level: str, message: str, metadata: Optional[dict] = None
 ) -> None:
@@ -114,6 +151,10 @@ async def run_healing_pipeline(payload: HealingTriggerSchema, session_id: int):
         await send_telemetry_log(
             "ERROR", f"Abort: {error_reason}", {"session_id": session_id}
         )
+        await fire_telegram_alert(
+            error_context=f"❌ HEAL ABORTED: {payload.target_agent.upper()}",
+            message_text=f"Git cloning or branch creation failed for session #{session_id}.",
+        )
         return
 
     # 2. Parse Traceback
@@ -125,6 +166,10 @@ async def run_healing_pipeline(payload: HealingTriggerSchema, session_id: int):
         await update_session_db(session_id, "failed", {"failure_reason": error_reason})
         await send_telemetry_log(
             "ERROR", f"Abort: {error_reason}", {"session_id": session_id}
+        )
+        await fire_telegram_alert(
+            error_context=f"❌ HEAL ABORTED: {payload.target_agent.upper()}",
+            message_text=f"Failed parsing relative file path from traceback:\n`{payload.error_message}`",
         )
         git_handler.clean_sandbox()
         return
@@ -140,6 +185,10 @@ async def run_healing_pipeline(payload: HealingTriggerSchema, session_id: int):
         await update_session_db(session_id, "failed", {"failure_reason": error_reason})
         await send_telemetry_log(
             "ERROR", f"Abort: {error_reason}", {"session_id": session_id}
+        )
+        await fire_telegram_alert(
+            error_context=f"❌ HEAL ABORTED: {payload.target_agent.upper()}",
+            message_text=f"Could not read target file `{relative_file_path}` in sandbox environment.",
         )
         git_handler.clean_sandbox()
         return
@@ -163,6 +212,10 @@ async def run_healing_pipeline(payload: HealingTriggerSchema, session_id: int):
         await send_telemetry_log(
             "ERROR", f"Abort: {error_reason}", {"session_id": session_id}
         )
+        await fire_telegram_alert(
+            error_context=f"⚠️ PATCH FAILED: {payload.target_agent.upper()}",
+            message_text=f"Claude was unable to isolate and generate a secure patch context for `{relative_file_path}`.",
+        )
         git_handler.clean_sandbox()
         return
 
@@ -182,6 +235,10 @@ async def run_healing_pipeline(payload: HealingTriggerSchema, session_id: int):
         await update_session_db(session_id, "failed", {"failure_reason": error_reason})
         await send_telemetry_log(
             "ERROR", f"Abort: {error_reason}", {"session_id": session_id}
+        )
+        await fire_telegram_alert(
+            error_context=f"❌ GITOPS ERROR: {payload.target_agent.upper()}",
+            message_text="Failed to stage, commit, or push changes to GitHub origin branch.",
         )
         git_handler.clean_sandbox()
         return
@@ -222,11 +279,25 @@ async def run_healing_pipeline(payload: HealingTriggerSchema, session_id: int):
             f"Execution status: success. Created PR #{pr_info['pr_number']}",
             {"session_id": session_id, "pr_url": pr_info["pr_url"]},
         )
+
+        # 🚨 TELEGRAM CELEBRATION DISPATCH 🚨
+        await fire_telegram_alert(
+            error_context=f"✅ HEALED SUCCESSFULLY: {payload.target_agent.upper()}",
+            message_text=(
+                f"Surgically patched `{relative_file_path}` on line {error_line}!\n\n"
+                f"Opened PR #{pr_info['pr_number']}\n"
+                f"🔗 [View GitHub Pull Request]({pr_info['pr_url']})"
+            ),
+        )
     else:
         error_reason = "Changes pushed but failed to initialize PR via GitHub API."
         await update_session_db(session_id, "failed", {"failure_reason": error_reason})
         await send_telemetry_log(
             "ERROR", f"Abort: {error_reason}", {"session_id": session_id}
+        )
+        await fire_telegram_alert(
+            error_context=f"⚠️ PR OPEN FAULT: {payload.target_agent.upper()}",
+            message_text=f"Hotfix branch was pushed, but Chiron failed to open GitHub PR automatically.",
         )
 
     # Clean sandbox
