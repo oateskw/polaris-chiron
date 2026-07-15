@@ -18,23 +18,19 @@ class ChironPatchGenerator:
         Parses a standard Python traceback to extract the relative file path
         and the last line number involved in the crash.
         """
-        # Look for python traceback lines: File "/tmp/chiron_sandbox/.../file.py", line 123, in function
-        # We target the last file frame in the stack trace as it is typically the origin of the crash
         matches = re.findall(r'File "([^"]+)", line (\d+)', traceback_str)
         if not matches:
             return None, None
 
         full_file_path, line_no = matches[-1]
 
-        # We want the relative path inside our cloned repository
-        # This strips out absolute system paths (e.g. /tmp/chiron_sandbox/polaris-beacon/)
+        # Extract relative path inside our cloned repository
         repo_name = os.path.basename(self.sandbox_path.rstrip("/"))
         relative_path_match = re.search(rf"{repo_name}/(.+)$", full_file_path)
 
         if relative_path_match:
             return relative_path_match.group(1), int(line_no)
 
-        # Fallback to the raw filename if extraction fails
         return os.path.basename(full_file_path), int(line_no)
 
     def read_target_file(self, file_path: str) -> Optional[str]:
@@ -55,54 +51,94 @@ class ChironPatchGenerator:
     def generate_fix(
         self, file_path: str, original_code: str, traceback_str: str, error_message: str
     ) -> Optional[str]:
-        """Sends the context to Claude to generate a clean code replacement."""
+        """Sends context to Claude to generate a surgical Search/Replace block, then applies it."""
         if not self.client:
             print("❌ [Chiron Patch] Anthropic API client not initialized.")
             return None
 
+        # We instruct Claude to use structured Git-style conflict markers for the fix
         system_prompt = (
-            "You are Chiron, the advanced autonomous code-healing agent for the Polaris ecosystem.\n"
-            "Your sole objective is to analyze a Python traceback, identify the root cause of the crash, "
-            "and modify the target source file to resolve the exception with surgical precision.\n\n"
-            "CRITICAL OPERATIONAL RULES:\n"
-            "1. SURGICAL PRECISION: Do NOT rewrite, refactor, or clean up functional code that is unrelated to the crash. "
-            "Preserve all existing logic, variables, and comments.\n"
-            "2. DEFENSIVE PROGRAMMING: Implement robust error handling (e.g., try-except blocks, null checks, or default fallback values) "
-            "around the failing line to prevent the agent from completely stalling in the future.\n"
-            "3. IMPORT INTEGRITY: Ensure you do not accidentally remove or break any existing import statements required by the rest of the file.\n"
-            "4. NO EXPLANATIONS: Do not explain the fix, do not write introductory prose, and do not provide post-fix commentary.\n"
-            "5. RAW PYTHON ONLY: Return ONLY valid, executable Python code. "
-            "Do NOT wrap your response in markdown code blocks (such as ```python ... ```). Output the code raw."
+            "You are Chiron, an advanced autonomous code-healing agent.\n"
+            "Your task is to review a Python traceback and a buggy source file, "
+            "then output a surgical SEARCH/REPLACE block to fix the crash.\n\n"
+            "You must output EXACTLY one block matching this format:\n"
+            "<<<<<<< SEARCH\n"
+            "[exact code lines from the original file that contain the bug]\n"
+            "=======\n"
+            "[the updated, defensively written code lines to replace them]\n"
+            ">>>>>>> REPLACE\n\n"
+            "RULES:\n"
+            "1. Precision: The SEARCH block must match the original file lines EXACTLY, including indentation and spaces.\n"
+            "2. Defensive: Wrap the fix with safety checks (e.g., zero-division or null checks) to prevent future crashes.\n"
+            "3. No prose: Do not explain the fix. Output ONLY the raw SEARCH/REPLACE block. Do not wrap in markdown ticks."
         )
 
         user_content = (
             f"Target File: {file_path}\n\n"
             f"Error Message:\n{error_message}\n\n"
             f"Traceback Details:\n{traceback_str}\n\n"
-            f"Original Source Code:\n---\n{original_code}\n---\n\n"
-            f"Please generate the fully functional, updated Python code that resolves the crash."
+            f"Original Source Code Around Error:\n---\n{original_code}\n---\n\n"
+            f"Provide the SEARCH/REPLACE block to resolve the bug."
         )
 
         try:
             response = self.client.messages.create(
                 model=self.model,
-                max_tokens=4000,
-                temperature=0.0,  # Strict temperature for deterministic code generation
+                max_tokens=1500,
+                temperature=0.0,
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_content}],
             )
 
-            # Combine block contents if spread out
-            patched_code = "".join([block.text for block in response.content]).strip()
+            response_text = "".join([block.text for block in response.content]).strip()
 
-            # Defensive clean up in case Claude outputs markdown wrappers anyway
-            if patched_code.startswith("```"):
-                patched_code = re.sub(r"^```python\s*", "", patched_code)
-                patched_code = re.sub(r"^```\s*", "", patched_code)
-                patched_code = re.sub(r"\s*```$", "", patched_code)
+            # Parse and apply the search-and-replace block safely
+            patched_code = self._apply_search_replace(original_code, response_text)
+            if not patched_code:
+                print(
+                    "❌ [Chiron Patch] Failed to match or apply Claude's SEARCH/REPLACE block."
+                )
+                return None
 
-            return patched_code.strip()
+            return patched_code
 
         except Exception as e:
             print(f"❌ [Chiron Patch] LLM API Call Failed: {e}")
             return None
+
+    def _apply_search_replace(
+        self, original_code: str, patch_instruction: str
+    ) -> Optional[str]:
+        """Parses the Git-style conflict blocks and swaps them into the original code."""
+        # Extract content between markers
+        pattern = r"<<<<<<< SEARCH\n(.*?)\n=======\n(.*?)\n>>>>>>> REPLACE"
+        match = re.search(pattern, patch_instruction, re.DOTALL)
+
+        if not match:
+            print(
+                "⚠️ [Chiron Patch] Could not parse SEARCH/REPLACE block from response. Output was:"
+            )
+            print(patch_instruction)
+            return None
+
+        search_block = match.group(1)
+        replace_block = match.group(2)
+
+        # Surgical swap
+        if search_block in original_code:
+            print(
+                "🎯 [Chiron Patch] Found exact match in target file. Executing surgical replacement..."
+            )
+            return original_code.replace(search_block, replace_block)
+
+        # Fallback: Strip whitespaces from ends to find matches with minor line spacing differences
+        if search_block.strip() in original_code:
+            print(
+                "🎯 [Chiron Patch] Found whitespace-flexible match in target file. Executing replacement..."
+            )
+            return original_code.replace(search_block.strip(), replace_block)
+
+        print(
+            "❌ [Chiron Patch] SEARCH block does not match any code in the original file."
+        )
+        return None
