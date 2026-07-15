@@ -61,13 +61,18 @@ class ChironPatchGenerator:
             return None
 
         system_prompt = (
-            "You are Chiron, an advanced autonomous code-healing agent. "
-            "Your task is to analyze a Python traceback and a buggy source file, "
-            "then rewrite the file to resolve the issue. "
-            "Return ONLY the complete, rewritten Python code for the file. "
-            "Do not include markdown code block formatting (like ```python ... ```), "
-            "do not include introductory or concluding text, and do not explain the fix. "
-            "Output only valid Python source code."
+            "You are Chiron, the advanced autonomous code-healing agent for the Polaris ecosystem.\n"
+            "Your sole objective is to analyze a Python traceback, identify the root cause of the crash, "
+            "and modify the target source file to resolve the exception with surgical precision.\n\n"
+            "CRITICAL OPERATIONAL RULES:\n"
+            "1. SURGICAL PRECISION: Do NOT rewrite, refactor, or clean up functional code that is unrelated to the crash. "
+            "Preserve all existing logic, variables, and comments.\n"
+            "2. DEFENSIVE PROGRAMMING: Implement robust error handling (e.g., try-except blocks, null checks, or default fallback values) "
+            "around the failing line to prevent the agent from completely stalling in the future.\n"
+            "3. IMPORT INTEGRITY: Ensure you do not accidentally remove or break any existing import statements required by the rest of the file.\n"
+            "4. NO EXPLANATIONS: Do not explain the fix, do not write introductory prose, and do not provide post-fix commentary.\n"
+            "5. RAW PYTHON ONLY: Return ONLY valid, executable Python code. "
+            "Do NOT wrap your response in markdown code blocks (such as ```python ... ```). Output the code raw."
         )
 
         user_content = (
