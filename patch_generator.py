@@ -1,7 +1,9 @@
 import os
 import re
+import subprocess
 from typing import Optional, Tuple
-from anthropic import Anthropic
+from anthropic import AsyncAnthropic
+from config import get_remote_prompt, get_agent_manifest
 
 
 class ChironPatchGenerator:
@@ -9,7 +11,7 @@ class ChironPatchGenerator:
         self.sandbox_path = sandbox_path
         self.api_key = os.getenv("ANTHROPIC_API_KEY")
         self.model = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest")
-        self.client = Anthropic(api_key=self.api_key) if self.api_key else None
+        self.client = AsyncAnthropic(api_key=self.api_key) if self.api_key else None
 
     def parse_traceback(
         self, traceback_str: str
@@ -48,81 +50,121 @@ class ChironPatchGenerator:
         with open(absolute_path, "w", encoding="utf-8") as f:
             f.write(new_content)
 
-    def generate_fix(
-        self, file_path: str, original_code: str, traceback_str: str, error_message: str
+    def run_sandbox_tests(self) -> Tuple[bool, str]:
+        """🚀 STEP 2: Runs local validation tests inside the sandbox directory."""
+        print("🧪 [Chiron Validator] Running local test suite to verify code sanity...")
+        try:
+            # We assume pytest is used; falls back to standard unittest if desired
+            result = subprocess.run(
+                ["pytest"],
+                cwd=self.sandbox_path,
+                capture_output=True,
+                text=True,
+                timeout=30.0,
+                shell=True,
+            )
+            if result.returncode == 0:
+                print("✅ [Chiron Validator] All sandbox tests passed successfully!")
+                return True, ""
+            else:
+                print(
+                    "❌ [Chiron Validator] Tests failed. Capturing regression errors."
+                )
+                return False, result.stdout + "\n" + result.stderr
+        except Exception as e:
+            return False, f"Test framework execution crashed: {str(e)}"
+
+    async def generate_fix(
+        self,
+        file_path: str,
+        original_code: str,
+        traceback_str: str,
+        error_message: str,
+        agent_name: str,
     ) -> Optional[str]:
-        """Sends a small line window context to Claude to generate a surgical swap."""
         if not self.client:
-            print("❌ [Chiron Patch] Anthropic API client not initialized.")
             return None
 
-        # 1. Parse the crashing line number from the traceback
         _, line_no = self.parse_traceback(traceback_str)
-        if not line_no:
-            print(
-                "⚠️ [Chiron Patch] Could not parse line number from traceback. Defaulting to full file."
-            )
-            line_no = 1
+        line_no = line_no or 1
 
-        # 2. Extract a 30-line window around the crash to prevent Claude from getting overwhelmed
         lines = original_code.splitlines()
         start_line = max(0, line_no - 15)
         end_line = min(len(lines), line_no + 15)
-
         context_window = "\n".join(lines[start_line:end_line])
 
-        # We instruct Claude to use a hyper-targeted SEARCH/REPLACE block matching the window
-        system_prompt = (
-            "You are Chiron, an advanced autonomous code-healing agent.\n"
-            "Your task is to review a Python traceback and a small slice of a buggy source file, "
-            "then output a surgical SEARCH/REPLACE block to fix the crash.\n\n"
-            "You must output EXACTLY one block matching this format:\n"
-            "<<<<<<< SEARCH\n"
-            "[exact code lines from the original file slice that contain the bug]\n"
-            "=======\n"
-            "[the updated, defensively written code lines to replace them]\n"
-            ">>>>>>> REPLACE\n\n"
-            "RULES:\n"
-            "1. Precision: Keep the SEARCH block as small and concise as possible (only 1-5 lines of code surrounding the crash).\n"
-            "2. Spacing: The SEARCH block must match the original file slice indentation and syntax EXACTLY.\n"
-            "3. Defensive: Wrap the fix with safety checks (e.g., zero-division or null checks) to prevent future crashes.\n"
-            "4. No prose: Do not explain the fix. Output ONLY the raw SEARCH/REPLACE block. Do not wrap in markdown ticks."
-        )
+        system_prompt = await get_remote_prompt("chiron", "reactive_healer")
+        if not system_prompt:
+            return None
+
+        # 🚀 STEP 1: Inject Agent Manifest Context
+        manifest = await get_agent_manifest(agent_name)
+        manifest_context = ""
+        if manifest:
+            manifest_context = (
+                f"--- TARGET AGENT ARCHITECTURE MANIFEST ---\n"
+                f"Agent Identity/Purpose: {manifest['purpose']}\n"
+                f"Known Architecture Dependencies: {manifest['dependencies']}\n"
+                f"Critical System Paths: {manifest['critical_paths']}\n"
+                f"Keep this agent's ultimate design purpose in mind when patching its bugs.\n"
+                f"-----------------------------------------\n\n"
+            )
 
         user_content = (
+            f"{manifest_context}"
             f"Target File: {file_path}\n"
             f"Crashing Line Number: {line_no}\n\n"
             f"Error Message:\n{error_message}\n\n"
             f"Traceback Details:\n{traceback_str}\n\n"
-            f"30-Line Slice Around Error (Lines {start_line + 1} to {end_line}):\n"
-            f"---\n{context_window}\n---\n\n"
+            f"30-Line Slice Around Error:\n---\n{context_window}\n---\n\n"
             f"Provide the tiny SEARCH/REPLACE block to resolve the bug."
         )
 
-        try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=500,  # Keep token limits tight so Claude focuses on a tiny edit
-                temperature=0.0,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_content}],
-            )
+        attempts = 0
+        working_code = original_code
+        test_failures = ""
 
-            response_text = "".join([block.text for block in response.content]).strip()
+        # Loop up to 2 times to self-correct if it generates an update that breaks tests
+        while attempts < 2:
+            if test_failures:
+                user_content += f"\n\n⚠️ YOUR PREVIOUS PATCH FAILED TESTS WITH THIS ERROR:\n{test_failures}\nAdjust your fix to satisfy the test requirements."
 
-            # Parse and apply the search-and-replace block safely
-            patched_code = self._apply_search_replace(original_code, response_text)
-            if not patched_code:
-                print(
-                    "❌ [Chiron Patch] Failed to match or apply Claude's SEARCH/REPLACE block."
+            try:
+                response = await self.client.messages.create(
+                    model=self.model,
+                    max_tokens=600,
+                    temperature=0.0,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": user_content}],
                 )
+                response_text = "".join(
+                    [block.text for block in response.content]
+                ).strip()
+                patched_code = self._apply_search_replace(working_code, response_text)
+
+                if not patched_code:
+                    return None
+
+                # Temp-write to sandbox to run tests against it
+                self.write_patched_file(file_path, patched_code)
+
+                # Run the newly built step 2 validation test
+                tests_passed, test_log = self.run_sandbox_tests()
+                if tests_passed:
+                    return patched_code
+
+                # If tests failed, store error and loop to self-correct
+                test_failures = test_log
+                attempts += 1
+
+            except Exception as e:
+                print(f"❌ [Chiron Patch] LLM Self-Correction Cycle Failed: {e}")
                 return None
 
-            return patched_code
-
-        except Exception as e:
-            print(f"❌ [Chiron Patch] LLM API Call Failed: {e}")
-            return None
+        print(
+            "❌ [Chiron Validator] Self-correction loop exhausted. Code changes failed tests."
+        )
+        return None
 
     def _apply_search_replace(
         self, original_code: str, patch_instruction: str

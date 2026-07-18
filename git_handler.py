@@ -1,8 +1,20 @@
 import os
+import stat
 import shutil
 import subprocess
+import tempfile
 import httpx
 from typing import Optional
+from pathlib import Path
+
+
+def remove_readonly(func, path, excinfo):
+    """Forcefully clears read-only attributes on Windows so shutil can delete .git objects."""
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except Exception:
+        pass  # Absorb failures silently if the handle is entirely locked
 
 
 class ChironGitHandler:
@@ -23,13 +35,18 @@ class ChironGitHandler:
         }
 
         self.repo_name = self.repo_map.get(self.target_agent)
+
+        # 🎯 WINDOWS SAFE: Dynamically fetches OS-native temp directories
+        base_temp = tempfile.gettempdir()
+
         # Sandbox folder inside Chiron's container to clone files into
-        self.sandbox_path = f"/tmp/chiron_sandbox/{self.repo_name}"
+        self.sandbox_path = str(Path(base_temp) / "chiron_sandbox" / self.repo_name)
 
     def clean_sandbox(self) -> None:
         """Removes the local sandbox directory if it already exists."""
         if os.path.exists(self.sandbox_path):
-            shutil.rmtree(self.sandbox_path)
+            # Using onexc for Python 3.12+ / 3.14 compatibility
+            shutil.rmtree(self.sandbox_path, onexc=remove_readonly)
 
     def clone_and_branch(self) -> bool:
         """Clones the target repository and checks out an isolated fix branch."""

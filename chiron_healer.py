@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 # Import our custom Chiron modules
 from git_handler import ChironGitHandler
 from patch_generator import ChironPatchGenerator
+from proactive_optimizer import run_proactive_optimization_pipeline
 
 load_dotenv()
 
@@ -23,6 +24,12 @@ class HealingTriggerSchema(BaseModel):
     error_message: str
     full_traceback: str
     metadata: Optional[dict[str, Any]] = None
+
+
+class OptimizationTriggerSchema(BaseModel):
+    target_agent: str
+    target_file: str | None = None
+    focus_area: Optional[str] = "general"
 
 
 async def fire_telegram_alert(error_context: str, message_text: str) -> None:
@@ -199,26 +206,32 @@ async def run_healing_pipeline(payload: HealingTriggerSchema, session_id: int):
         f"Generating automated hotfix for '{relative_file_path}' at line {error_line} via Claude-3.5-Sonnet...",
         {"session_id": session_id},
     )
-    patched_code = patch_generator.generate_fix(
+
+    # 🚀 SURGICAL FIX: Await the updated async generate_fix method
+    # and explicitly pass the target_agent name for context harvesting!
+    patched_code = await patch_generator.generate_fix(
         file_path=relative_file_path,
         original_code=original_code,
         traceback_str=payload.full_traceback,
         error_message=payload.error_message,
+        agent_name=payload.target_agent,  # 🌟 Added target_agent name parameter
     )
 
     if not patched_code:
-        error_reason = "AI Patch Generator failed to output a code fix."
+        error_reason = "AI Patch Generator failed to output a code fix or could not pass sandbox tests."
         await update_session_db(session_id, "failed", {"failure_reason": error_reason})
         await send_telemetry_log(
             "ERROR", f"Abort: {error_reason}", {"session_id": session_id}
         )
         await fire_telegram_alert(
             error_context=f"⚠️ PATCH FAILED: {payload.target_agent.upper()}",
-            message_text=f"Claude was unable to isolate and generate a secure patch context for `{relative_file_path}`.",
+            message_text=f"Claude was unable to isolate a patch, or the fix broken local sandbox unit tests for `{relative_file_path}`.",
         )
         git_handler.clean_sandbox()
         return
 
+    # Note: patch_generator.generate_fix already handles writing the final
+    # test-passing code block to disk, but keeping this explicitly ensures consistency.
     patch_generator.write_patched_file(relative_file_path, patched_code)
     await update_session_db(session_id, "patch_generated")
 
@@ -310,7 +323,6 @@ async def trigger_healing(
     background_tasks: BackgroundTasks,
     x_chiron_key: Optional[str] = Header(default=None),
 ):
-    # Standardized handshake token verification using HELIX_AUTH_TOKEN
     expected_key = os.getenv("HELIX_AUTH_TOKEN")
     if not expected_key or not x_chiron_key:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -365,4 +377,24 @@ async def trigger_healing(
         "status": "healing_session_initiated",
         "target_agent": payload.target_agent,
         "session_id": session_id,
+    }
+
+
+@app.post("/api/v1/chiron/optimize")
+async def trigger_optimization(
+    payload: OptimizationTriggerSchema,
+    background_tasks: BackgroundTasks,
+    x_chiron_key: Optional[str] = Header(default=None),  # 🔒 Secured validation check
+):
+    expected_key = os.getenv("HELIX_AUTH_TOKEN")
+    if not expected_key or not x_chiron_key:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if not hmac.compare_digest(x_chiron_key, expected_key):
+        raise HTTPException(status_code=401, detail="Unauthorized handshake signature")
+
+    background_tasks.add_task(run_proactive_optimization_pipeline, payload)
+    return {
+        "status": "optimization_analysis_scheduled",
+        "target_agent": payload.target_agent,
     }
