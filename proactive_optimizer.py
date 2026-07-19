@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sys
 import re
 import datetime
 import subprocess
@@ -34,19 +35,42 @@ class ChironProactiveOptimizer:
             f.write(new_content)
 
     def run_sandbox_tests(self) -> Tuple[bool, str]:
-        """🚀 STEP 2: Runs local validation tests inside the sandbox directory."""
+        """🚀 STEP 2: Runs local validation tests inside the sandbox directory with virtual environment awareness."""
         print("🧪 [Chiron Validator] Testing proactive structural optimizations...")
         try:
+            env_override = os.environ.copy()
+            env_override["PYTHONPATH"] = (
+                self.sandbox_path + os.pathsep + env_override.get("PYTHONPATH", "")
+            )
+
+            # 💡 Use the active system virtual environment interpreter explicitly if it exists
+            # This ensures packages and internal paths are aligned perfectly
+            if hasattr(sys, "real_prefix") or (sys.base_prefix != sys.prefix):
+                # We are in a venv! Pass the active python context down
+                pytest_cmd = [sys.executable, "-m", "pytest", "--ignore=archive"]
+            else:
+                # Fallback to local executable pathing if running un-isolated
+                venv_pytest = (
+                    os.path.join(os.getcwd(), ".venv", "Scripts", "pytest.exe")
+                    if os.name == "nt"
+                    else os.path.join(os.getcwd(), ".venv", "bin", "pytest")
+                )
+                pytest_cmd = (
+                    [venv_pytest, "--ignore=archive"]
+                    if os.path.exists(venv_pytest)
+                    else ["pytest", "--ignore=archive"]
+                )
+
             result = subprocess.run(
-                ["pytest", "--ignore=archive"],
+                pytest_cmd,
                 cwd=self.sandbox_path,
+                env=env_override,
                 capture_output=True,
                 text=True,
                 timeout=30.0,
                 shell=True,
             )
 
-            # Exit code 0 = Tests passed. Exit code 5 = No tests found (acceptable for un-tested repos)
             if result.returncode in [0, 5]:
                 if result.returncode == 5:
                     print(
@@ -85,6 +109,16 @@ class ChironProactiveOptimizer:
                 f"-----------------------------------------\n\n"
             )
 
+        # 🔍 DIAGNOSTIC: Check if the source code length is zero before hitting the API
+        print(
+            f"🔬 [Diagnostic] Sending '{file_path}' to Claude. Code Length: {len(original_code or '')} chars."
+        )
+        if not original_code or not original_code.strip():
+            print(
+                f"⚠️ [Diagnostic] Skipping API call for '{file_path}' because the file content is empty string!"
+            )
+            return original_code
+
         user_content = (
             f"{manifest_context}"
             f"Target File: {file_path}\n"
@@ -112,6 +146,12 @@ class ChironProactiveOptimizer:
                 response_text = "".join(
                     [block.text for block in response.content]
                 ).strip()
+
+                # 🔍 DEBUG PRINT: Inspect the raw LLM output format in bash
+                print(f"\n--- DEBUG: RAW CLAUDE RESPONSE FOR {file_path} ---")
+                print(response_text)
+                print("---------------------------------------------------\n")
+
                 optimized_code = self._apply_multi_search_replace(
                     working_code, response_text
                 )
@@ -143,21 +183,52 @@ class ChironProactiveOptimizer:
     def _apply_multi_search_replace(
         self, original_code: str, patch_instruction: str
     ) -> Optional[str]:
+        # Strict pattern parsing for multi-block returns
         pattern = r"<<<<<<< SEARCH\n(.*?)\n=======\n(.*?)\n>>>>>>> REPLACE"
         matches = list(re.finditer(pattern, patch_instruction, re.DOTALL))
-        if not matches:
-            print("⚠️ [Chiron Proactive] No optimization blocks matched.")
-            return None
 
-        working_code = original_code
-        for match in matches:
-            search_block = match.group(1)
-            replace_block = match.group(2)
-            if search_block in working_code:
-                working_code = working_code.replace(search_block, replace_block)
-            elif search_block.strip() in working_code:
-                working_code = working_code.replace(search_block.strip(), replace_block)
-        return working_code
+        if matches:
+            working_code = original_code
+            for match in matches:
+                search_block = match.group(1)
+                replace_block = match.group(2)
+
+                # Check for exact matches to avoid partial string contamination
+                if search_block in working_code:
+                    working_code = working_code.replace(search_block, replace_block)
+                elif search_block.strip() in working_code:
+                    working_code = working_code.replace(
+                        search_block.strip(), replace_block
+                    )
+                else:
+                    # SAFETY GATELOCK: If Claude hallucinates a search block that doesn't exist,
+                    # do NOT apply partial changes to this module. Bailing protects file sanity.
+                    print(
+                        "⚠️ [Chiron Patch Engine] Search block mismatch detected. Skipping file iteration to prevent syntax corruption."
+                    )
+                    return original_code
+            return working_code
+
+        # 2. Fallback: If no custom blocks matched, check if Claude returned a full markdown code block
+        print(
+            "ℹ️ [Chiron Proactive] No SEARCH/REPLACE blocks. Trying Markdown code block fallback..."
+        )
+        md_pattern = r"```(?:python)?\n(.*?)\n```"
+        md_match = re.search(md_pattern, patch_instruction, re.DOTALL)
+
+        if md_match:
+            extracted_code = md_match.group(1).strip()
+            # Safety check: ensure it didn't just return an empty block
+            if len(extracted_code) > 10 and extracted_code != original_code.strip():
+                print(
+                    "🎯 [Chiron Proactive] Successfully extracted a full module rewrite from Markdown code block."
+                )
+                return extracted_code
+
+        print(
+            "⚠️ [Chiron Proactive] No structural optimizations could be successfully parsed."
+        )
+        return None
 
 
 # 🌟 THE ENTIRE MISSING TASK FUNCTION PLUGGED BACK IN RIGHT HERE:
