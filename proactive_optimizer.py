@@ -254,6 +254,25 @@ async def run_proactive_optimization_pipeline(payload):
                         os.path.join(root, file), git_handler.sandbox_path
                     )
                     python_files_found.append(relative_path)
+        
+        # Target map for explicit module scoping
+        TARGET_MODULE_MAP = {
+            "beacon": ["beacon_agent.py"],
+            "nova": ["nova_agent.py"],
+            "vanguard": ["vanguard_core.py"],
+        }
+
+        # Filter out extraneous agents (nexus, pulsar, radar) in multi-agent repos
+        agent_key = payload.target_agent.lower()
+        if agent_key in TARGET_MODULE_MAP:
+            allowed = TARGET_MODULE_MAP[agent_key]
+            filtered = [f for f in python_files_found if any(f.endswith(target) for target in allowed)]
+            if filtered:
+                python_files_found = filtered
+        else:
+            # General fallback: skip sister agent modules in shared repositories
+            ignore_list = ["nexus_agent.py", "pulsar_agent.py", "radar_agent.py"]
+            python_files_found = [f for f in python_files_found if not any(f.endswith(ignored) for ignored in ignore_list)]
 
         if not python_files_found:
             await send_telemetry_log(
