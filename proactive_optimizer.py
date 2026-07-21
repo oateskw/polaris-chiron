@@ -5,9 +5,8 @@ import re
 import datetime
 import subprocess
 from typing import Optional, Tuple
+from anthropic import AsyncAnthropic
 from config import get_remote_prompt, get_agent_manifest
-from anthropic import AsyncAnthropic  # 🚀 Changed to AsyncAnthropic
-from config import get_remote_prompt
 
 # Global execution lock to prevent parallel path conflicts
 OPTIMIZER_LOCK = asyncio.Lock()
@@ -18,7 +17,6 @@ class ChironProactiveOptimizer:
         self.sandbox_path = sandbox_path
         self.api_key = os.getenv("ANTHROPIC_API_KEY")
         self.model = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest")
-        # 🚀 Using the async client syntax
         self.client = AsyncAnthropic(api_key=self.api_key) if self.api_key else None
 
     def read_target_file(self, file_path: str) -> Optional[str]:
@@ -35,7 +33,7 @@ class ChironProactiveOptimizer:
             f.write(new_content)
 
     def run_sandbox_tests(self) -> Tuple[bool, str]:
-        """🚀 STEP 2: Runs local validation tests inside the sandbox directory with virtual environment awareness."""
+        """Runs local validation tests inside the sandbox directory."""
         print("🧪 [Chiron Validator] Testing proactive structural optimizations...")
         try:
             env_override = os.environ.copy()
@@ -43,13 +41,9 @@ class ChironProactiveOptimizer:
                 self.sandbox_path + os.pathsep + env_override.get("PYTHONPATH", "")
             )
 
-            # 💡 Use the active system virtual environment interpreter explicitly if it exists
-            # This ensures packages and internal paths are aligned perfectly
             if hasattr(sys, "real_prefix") or (sys.base_prefix != sys.prefix):
-                # We are in a venv! Pass the active python context down
                 pytest_cmd = [sys.executable, "-m", "pytest", "--ignore=archive"]
             else:
-                # Fallback to local executable pathing if running un-isolated
                 venv_pytest = (
                     os.path.join(os.getcwd(), ".venv", "Scripts", "pytest.exe")
                     if os.name == "nt"
@@ -88,6 +82,7 @@ class ChironProactiveOptimizer:
         original_code: str,
         agent_name: str,
         focus_area: str = "general",
+        optimization_spec: Optional[str] = None,
     ) -> Optional[str]:
         if not self.client:
             return None
@@ -96,7 +91,6 @@ class ChironProactiveOptimizer:
         if not system_prompt:
             return None
 
-        # 🚀 STEP 1: Inject Agent Manifest Context
         manifest = await get_agent_manifest(agent_name)
         manifest_context = ""
         if manifest:
@@ -109,7 +103,6 @@ class ChironProactiveOptimizer:
                 f"-----------------------------------------\n\n"
             )
 
-        # 🔍 DIAGNOSTIC: Check if the source code length is zero before hitting the API
         print(
             f"🔬 [Diagnostic] Sending '{file_path}' to Claude. Code Length: {len(original_code or '')} chars."
         )
@@ -119,10 +112,17 @@ class ChironProactiveOptimizer:
             )
             return original_code
 
+        spec_instruction = (
+            f"\nSPECIFIC AUDIT DIRECTIVE:\n{optimization_spec}\n"
+            if optimization_spec
+            else ""
+        )
+
         user_content = (
             f"{manifest_context}"
             f"Target File: {file_path}\n"
-            f"Optimization Focus Area: {focus_area}\n\n"
+            f"Optimization Focus Area: {focus_area}\n"
+            f"{spec_instruction}\n"
             f"Full Source Code:\n---\n{original_code}\n---\n\n"
             f"Provide the surgical SEARCH/REPLACE blocks to optimize this module."
         )
@@ -147,11 +147,6 @@ class ChironProactiveOptimizer:
                     [block.text for block in response.content]
                 ).strip()
 
-                # 🔍 DEBUG PRINT: Inspect the raw LLM output format in bash
-                print(f"\n--- DEBUG: RAW CLAUDE RESPONSE FOR {file_path} ---")
-                print(response_text)
-                print("---------------------------------------------------\n")
-
                 optimized_code = self._apply_multi_search_replace(
                     working_code, response_text
                 )
@@ -174,16 +169,11 @@ class ChironProactiveOptimizer:
         print(
             "❌ [Chiron Validator] Optimization abandoned. Changes could not pass unit tests securely."
         )
-        if test_failures:
-            print("\n❗ [CHIRON SANDBOX UNIT TEST FAILURE LOGS] ❗")
-            print(test_failures)
-            print("---------------------------------------------\n")
         return None
 
     def _apply_multi_search_replace(
         self, original_code: str, patch_instruction: str
     ) -> Optional[str]:
-        # Strict pattern parsing for multi-block returns
         pattern = r"<<<<<<< SEARCH\n(.*?)\n=======\n(.*?)\n>>>>>>> REPLACE"
         matches = list(re.finditer(pattern, patch_instruction, re.DOTALL))
 
@@ -193,7 +183,6 @@ class ChironProactiveOptimizer:
                 search_block = match.group(1)
                 replace_block = match.group(2)
 
-                # Check for exact matches to avoid partial string contamination
                 if search_block in working_code:
                     working_code = working_code.replace(search_block, replace_block)
                 elif search_block.strip() in working_code:
@@ -201,37 +190,23 @@ class ChironProactiveOptimizer:
                         search_block.strip(), replace_block
                     )
                 else:
-                    # SAFETY GATELOCK: If Claude hallucinates a search block that doesn't exist,
-                    # do NOT apply partial changes to this module. Bailing protects file sanity.
                     print(
-                        "⚠️ [Chiron Patch Engine] Search block mismatch detected. Skipping file iteration to prevent syntax corruption."
+                        "⚠️ [Chiron Patch Engine] Search block mismatch detected. Skipping file iteration."
                     )
                     return original_code
             return working_code
 
-        # 2. Fallback: If no custom blocks matched, check if Claude returned a full markdown code block
-        print(
-            "ℹ️ [Chiron Proactive] No SEARCH/REPLACE blocks. Trying Markdown code block fallback..."
-        )
         md_pattern = r"```(?:python)?\n(.*?)\n```"
         md_match = re.search(md_pattern, patch_instruction, re.DOTALL)
 
         if md_match:
             extracted_code = md_match.group(1).strip()
-            # Safety check: ensure it didn't just return an empty block
             if len(extracted_code) > 10 and extracted_code != original_code.strip():
-                print(
-                    "🎯 [Chiron Proactive] Successfully extracted a full module rewrite from Markdown code block."
-                )
                 return extracted_code
 
-        print(
-            "⚠️ [Chiron Proactive] No structural optimizations could be successfully parsed."
-        )
         return None
 
 
-# 🌟 THE ENTIRE MISSING TASK FUNCTION PLUGGED BACK IN RIGHT HERE:
 async def run_proactive_optimization_pipeline(payload):
     """🧠 CHIRON PROACTIVE CRAWLER ENGINE (Sequential Module Evolution)"""
     from git_handler import ChironGitHandler
@@ -257,14 +232,11 @@ async def run_proactive_optimization_pipeline(payload):
             f"Chiron initiating repository-wide crawl optimization for agent: '{payload.target_agent}'",
         )
 
-        # 1. Clone the target repository and switch to the new isolated branch
         if not git_handler.clone_and_branch():
             return
 
-        # 2. 🚀 THE CRAWLER: Map out the entire sandboxed workspace
         python_files_found = []
         for root, _, files in os.walk(git_handler.sandbox_path):
-            # Explicitly ignore virtual environments, git configs, and cache directories
             if any(
                 ignored in root
                 for ignored in [
@@ -278,7 +250,6 @@ async def run_proactive_optimization_pipeline(payload):
                 continue
             for file in files:
                 if file.endswith(".py"):
-                    # Derive the relative path from the repository root
                     relative_path = os.path.relpath(
                         os.path.join(root, file), git_handler.sandbox_path
                     )
@@ -298,7 +269,8 @@ async def run_proactive_optimization_pipeline(payload):
         )
         modules_optimized = []
 
-        # 3. Systematically evaluate every discovered file sequentially
+        optimization_spec = getattr(payload, "optimization_specification", None)
+
         for rel_file_path in python_files_found:
             original_code = optimizer.read_target_file(rel_file_path)
             if not original_code:
@@ -308,35 +280,31 @@ async def run_proactive_optimization_pipeline(payload):
                 "INFO", f"Scanning module architecture footprint: `{rel_file_path}`"
             )
 
-            # This call leverages Step 1 (Manifest Context) and Step 2 (The Sandbox Test Loop) per file!
             optimized_code = await optimizer.generate_optimization(
                 file_path=rel_file_path,
                 original_code=original_code,
                 agent_name=payload.target_agent,
-                focus_area=payload.focus_area,
+                focus_area=getattr(payload, "focus_area", "general"),
+                optimization_spec=optimization_spec,
             )
 
-            # If Claude generated a stable optimization that passed all unit tests, save it
             if optimized_code and optimized_code != original_code:
                 optimizer.write_patched_file(rel_file_path, optimized_code)
                 modules_optimized.append(rel_file_path)
 
-        # 4. Check if any structural changes actually stuck
         if not modules_optimized:
             await send_telemetry_log(
                 "INFO",
-                f"Crawl complete. Fleet code configuration matching optimal target thresholds.",
+                "Crawl complete. Fleet code configuration matching optimal target thresholds.",
             )
             git_handler.clean_sandbox()
             return
 
-        # 5. Commit all accumulated, test-verified optimizations together
         commit_msg = f"refactor({payload.target_agent}): comprehensive autonomous codebase optimization suite"
         if not git_handler.stage_commit_and_push(commit_msg):
             git_handler.clean_sandbox()
             return
 
-        # 6. Formulate a grouped Evolution Pull Request
         file_list_str = "\n".join([f"* `{f}`" for f in modules_optimized])
         pr_title = f"🚀 [Chiron Base Evolution] Optimized Structural Layout inside `{payload.target_agent}`"
         pr_body = (
@@ -351,7 +319,6 @@ async def run_proactive_optimization_pipeline(payload):
 
         pr_info = await git_handler.open_pull_request(pr_title, pr_body)
         if pr_info:
-            # 🚀 PHASE 3 SENTINEL: Spin up non-blocking background watchdog telemetry loop
             from watchdog import monitor_production_telemetry
 
             asyncio.create_task(

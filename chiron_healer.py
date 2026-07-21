@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException, Header, BackgroundTasks
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-# Import our custom Chiron modules
+# Import custom Chiron modules
 from git_handler import ChironGitHandler
 from patch_generator import ChironPatchGenerator
 from proactive_optimizer import run_proactive_optimization_pipeline
@@ -28,8 +28,12 @@ class HealingTriggerSchema(BaseModel):
 
 class OptimizationTriggerSchema(BaseModel):
     target_agent: str
-    target_file: str | None = None
+    target_file: Optional[str] = None
     focus_area: Optional[str] = "general"
+    reason: Optional[str] = None
+    issues_detected: Optional[list[str]] = None
+    optimization_specification: Optional[str] = None
+    metrics_context: Optional[dict[str, Any]] = None
 
 
 async def fire_telegram_alert(error_context: str, message_text: str) -> None:
@@ -44,7 +48,6 @@ async def fire_telegram_alert(error_context: str, message_text: str) -> None:
     clean_context = error_context.replace("\r", "").strip()
     clean_msg = message_text.replace("\r", "").strip()
 
-    # Markdown-formatted notification for Telegram
     formatted_text = (
         f"🩺 **CHIRON GITOPS UPDATE**\n\n"
         f"📅 **Timestamp:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
@@ -59,12 +62,12 @@ async def fire_telegram_alert(error_context: str, message_text: str) -> None:
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(url, json=payload)
-            if resp.status_code == 200:
-                print("📨 [Chiron Telegram] Notification pushed successfully.")
-            else:
+            if resp.status_code != 200:
                 print(
                     f"⚠️ [Chiron Telegram] Rejected dispatch: {resp.status_code} - {resp.text}"
                 )
+            else:
+                print("📨 [Chiron Telegram] Notification pushed successfully.")
     except Exception as e:
         print(f"❌ [Chiron Telegram] Connection failure to Telegram API: {e}")
 
@@ -100,14 +103,14 @@ async def send_telemetry_log(
 async def update_session_db(
     session_id: int, status: str, extra_fields: Optional[dict] = None
 ) -> None:
-    """Helper to update our tracking state directly in the Neon Postgres Database."""
+    """Helper to update state directly in Neon Postgres."""
     db_url = os.getenv("DATABASE_URL", "")
     if not db_url:
         print("⚠️ DATABASE_URL not set. Skipping session DB update.")
         return
 
     set_clause = "status = %s, updated_at = NOW()"
-    params = [status]
+    params: list[Any] = [status]
 
     if extra_fields:
         for key, value in extra_fields.items():
@@ -207,14 +210,12 @@ async def run_healing_pipeline(payload: HealingTriggerSchema, session_id: int):
         {"session_id": session_id},
     )
 
-    # 🚀 SURGICAL FIX: Await the updated async generate_fix method
-    # and explicitly pass the target_agent name for context harvesting!
     patched_code = await patch_generator.generate_fix(
         file_path=relative_file_path,
         original_code=original_code,
         traceback_str=payload.full_traceback,
         error_message=payload.error_message,
-        agent_name=payload.target_agent,  # 🌟 Added target_agent name parameter
+        agent_name=payload.target_agent,
     )
 
     if not patched_code:
@@ -225,13 +226,11 @@ async def run_healing_pipeline(payload: HealingTriggerSchema, session_id: int):
         )
         await fire_telegram_alert(
             error_context=f"⚠️ PATCH FAILED: {payload.target_agent.upper()}",
-            message_text=f"Claude was unable to isolate a patch, or the fix broken local sandbox unit tests for `{relative_file_path}`.",
+            message_text=f"Claude was unable to isolate a patch, or the fix broke local sandbox unit tests for `{relative_file_path}`.",
         )
         git_handler.clean_sandbox()
         return
 
-    # Note: patch_generator.generate_fix already handles writing the final
-    # test-passing code block to disk, but keeping this explicitly ensures consistency.
     patch_generator.write_patched_file(relative_file_path, patched_code)
     await update_session_db(session_id, "patch_generated")
 
@@ -256,7 +255,6 @@ async def run_healing_pipeline(payload: HealingTriggerSchema, session_id: int):
         git_handler.clean_sandbox()
         return
 
-    # Format the PR
     pr_title = f"🩹 [Chiron Auto-Fix] Resolve Runtime Crash in `{payload.target_agent}`"
     pr_body = (
         f"### 🤖 Chiron Autonomous Healing Report\n\n"
@@ -293,7 +291,6 @@ async def run_healing_pipeline(payload: HealingTriggerSchema, session_id: int):
             {"session_id": session_id, "pr_url": pr_info["pr_url"]},
         )
 
-        # 🚨 TELEGRAM CELEBRATION DISPATCH 🚨
         await fire_telegram_alert(
             error_context=f"✅ HEALED SUCCESSFULLY: {payload.target_agent.upper()}",
             message_text=(
@@ -310,10 +307,9 @@ async def run_healing_pipeline(payload: HealingTriggerSchema, session_id: int):
         )
         await fire_telegram_alert(
             error_context=f"⚠️ PR OPEN FAULT: {payload.target_agent.upper()}",
-            message_text=f"Hotfix branch was pushed, but Chiron failed to open GitHub PR automatically.",
+            message_text="Hotfix branch was pushed, but Chiron failed to open GitHub PR automatically.",
         )
 
-    # Clean sandbox
     git_handler.clean_sandbox()
 
 
@@ -384,7 +380,7 @@ async def trigger_healing(
 async def trigger_optimization(
     payload: OptimizationTriggerSchema,
     background_tasks: BackgroundTasks,
-    x_chiron_key: Optional[str] = Header(default=None),  # 🔒 Secured validation check
+    x_chiron_key: Optional[str] = Header(default=None),
 ):
     expected_key = os.getenv("HELIX_AUTH_TOKEN")
     if not expected_key or not x_chiron_key:
