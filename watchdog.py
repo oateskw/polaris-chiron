@@ -54,11 +54,22 @@ async def monitor_production_telemetry(
 async def fetch_live_error_count(agent_name: str, logs_url: str) -> int:
     """Queries centralized Helix log analytics infrastructure for active error counts."""
     endpoint = f"{logs_url}/api/v1/telemetry/errors-count?agent={agent_name.lower()}"
+
+    # 🚀 Add authorization header from environment variables
+    headers = {
+        "X-Helix-Auth-Token": os.getenv("HELIX_AUTH_TOKEN", ""),
+        "Content-Type": "application/json",
+    }
+
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(endpoint)
+            resp = await client.get(endpoint, headers=headers)
             if resp.status_code == 200:
                 return int(resp.json().get("error_count", 0))
+            else:
+                print(
+                    f"⚠️ [Watchdog Log Pull Failed] HTTP {resp.status_code}: {resp.text}"
+                )
     except Exception as e:
         print(f"⚠️ [Watchdog Log Pull Failed] Exception calling metrics engine: {e}")
     return 0
