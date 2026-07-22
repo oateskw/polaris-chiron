@@ -83,6 +83,7 @@ class ChironProactiveOptimizer:
         agent_name: str,
         focus_area: str = "general",
         optimization_spec: Optional[str] = None,
+        combined_manifest_prompt: Optional[str] = None,  # 🚀 ADD THIS
     ) -> Optional[str]:
         if not self.client:
             return None
@@ -91,17 +92,26 @@ class ChironProactiveOptimizer:
         if not system_prompt:
             return None
 
-        manifest = await get_agent_manifest(agent_name)
-        manifest_context = ""
-        if manifest:
+        # 🚀 Prioritize the aggregated directives if available; otherwise fall back
+        if combined_manifest_prompt:
             manifest_context = (
                 f"--- TARGET AGENT ARCHITECTURE MANIFEST ---\n"
-                f"Agent Purpose: {manifest['purpose']}\n"
-                f"Dependencies: {manifest['dependencies']}\n"
-                f"Critical Paths: {manifest['critical_paths']}\n"
+                f"{combined_manifest_prompt}\n"
                 f"Ensure optimizations align with the architectural goal of this agent. Do not break design patterns.\n"
                 f"-----------------------------------------\n\n"
             )
+        else:
+            manifest = await get_agent_manifest(agent_name)
+            manifest_context = ""
+            if manifest:
+                manifest_context = (
+                    f"--- TARGET AGENT ARCHITECTURE MANIFEST ---\n"
+                    f"Agent Purpose: {manifest['purpose']}\n"
+                    f"Dependencies: {manifest['dependencies']}\n"
+                    f"Critical Paths: {manifest['critical_paths']}\n"
+                    f"Ensure optimizations align with the architectural goal of this agent. Do not break design patterns.\n"
+                    f"-----------------------------------------\n\n"
+                )
 
         print(
             f"🔬 [Diagnostic] Sending '{file_path}' to Claude. Code Length: {len(original_code or '')} chars."
@@ -207,7 +217,36 @@ class ChironProactiveOptimizer:
         return None
 
 
-async def run_proactive_optimization_pipeline(payload):
+async def get_combined_agent_manifest(conn, agent_name: str) -> dict:
+    """Aggregates all active manifest rows for a target agent into a single execution context."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT target_repository, system_prompt, config
+            FROM helix_agent_manifests
+            WHERE agent_name = %s AND is_active = TRUE;
+            """,
+            (agent_name.lower(),),
+        )
+        rows = await cur.fetchall()
+
+    if not rows:
+        return None
+
+    # Resolve target repository from the first matching row
+    target_repo = rows[0][0]
+
+    # Combine directives across all manifest rules for this agent
+    combined_directives = "\n---\n".join([r[1] for r in rows if r[1]])
+
+    return {
+        "agent_name": agent_name,
+        "target_repository": target_repo,
+        "system_prompt": combined_directives,
+    }
+
+
+async def run_proactive_optimization_pipeline(payload, db_pool=None):
     """🧠 CHIRON PROACTIVE CRAWLER ENGINE (Sequential Module Evolution)"""
     from git_handler import ChironGitHandler
     from chiron_healer import send_telemetry_log, fire_telegram_alert
@@ -222,8 +261,24 @@ async def run_proactive_optimization_pipeline(payload):
         timestamp_str = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         branch_name = f"optimization/{payload.target_agent}-{timestamp_str}"
 
+        # 🚀 STEP 1: Fetch aggregated manifest & repository target from DB
+        manifest_data = None
+        target_repo = None
+        combined_prompt = None
+        if db_pool:
+            async with db_pool.connection() as conn:
+                manifest_data = await get_combined_agent_manifest(
+                    conn, payload.target_agent
+                )
+                if manifest_data:
+                    target_repo = manifest_data.get("target_repository")
+                    combined_prompt = manifest_data.get("system_prompt")
+
+        # 🚀 STEP 2: Instantiate Git Handler with resolved target_repository
         git_handler = ChironGitHandler(
-            target_agent=payload.target_agent, branch_name=branch_name
+            target_agent=payload.target_agent,
+            branch_name=branch_name,
+            target_repository=target_repo,  # Eliminates NoneType sandbox crashes!
         )
         optimizer = ChironProactiveOptimizer(sandbox_path=git_handler.sandbox_path)
 
@@ -254,25 +309,35 @@ async def run_proactive_optimization_pipeline(payload):
                         os.path.join(root, file), git_handler.sandbox_path
                     )
                     python_files_found.append(relative_path)
-        
-        # Target map for explicit module scoping
+
+        # 🚀 STEP 3: Normalize agent key to match base module mapping
+        base_agent = payload.target_agent.lower().split("_")[
+            0
+        ]  # "nova_harvest_optimizer" -> "nova"
+
         TARGET_MODULE_MAP = {
             "beacon": ["beacon_agent.py"],
             "nova": ["nova_agent.py"],
             "vanguard": ["vanguard_core.py"],
         }
 
-        # Filter out extraneous agents (nexus, pulsar, radar) in multi-agent repos
-        agent_key = payload.target_agent.lower()
-        if agent_key in TARGET_MODULE_MAP:
-            allowed = TARGET_MODULE_MAP[agent_key]
-            filtered = [f for f in python_files_found if any(f.endswith(target) for target in allowed)]
+        if base_agent in TARGET_MODULE_MAP:
+            allowed = TARGET_MODULE_MAP[base_agent]
+            filtered = [
+                f
+                for f in python_files_found
+                if any(f.endswith(target) for target in allowed)
+            ]
             if filtered:
                 python_files_found = filtered
         else:
             # General fallback: skip sister agent modules in shared repositories
             ignore_list = ["nexus_agent.py", "pulsar_agent.py", "radar_agent.py"]
-            python_files_found = [f for f in python_files_found if not any(f.endswith(ignored) for ignored in ignore_list)]
+            python_files_found = [
+                f
+                for f in python_files_found
+                if not any(f.endswith(ignored) for ignored in ignore_list)
+            ]
 
         if not python_files_found:
             await send_telemetry_log(
@@ -305,6 +370,7 @@ async def run_proactive_optimization_pipeline(payload):
                 agent_name=payload.target_agent,
                 focus_area=getattr(payload, "focus_area", "general"),
                 optimization_spec=optimization_spec,
+                combined_manifest_prompt=combined_prompt,
             )
 
             if optimized_code and optimized_code != original_code:

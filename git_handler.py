@@ -18,23 +18,37 @@ def remove_readonly(func, path, excinfo):
 
 
 class ChironGitHandler:
-    def __init__(self, target_agent: str, branch_name: str):
+    def __init__(
+        self,
+        target_agent: str,
+        branch_name: str,
+        target_repository: Optional[
+            str
+        ] = None,  # 🚀 ADDED: Accepts dynamic target repository
+    ):
         self.target_agent = target_agent.lower()
         self.branch_name = branch_name
         self.github_token = os.getenv("GITHUB_TOKEN")
-        self.github_org = os.getenv(
-            "GITHUB_ORG_OR_USER"
-        )  # Your GitHub organization/username
+        self.github_org = os.getenv("GITHUB_ORG_OR_USER")
 
-        # Target repo map (maps agent names to their exact repository names)
-        self.repo_map = {
+        # 🚀 Prioritize DB value -> Fall back to normalized base repo -> Safety fallback
+        base_agent = self.target_agent.split("_")[
+            0
+        ]  # "nova_harvest_optimizer" -> "nova"
+
+        fallback_map = {
             "helix": "polaris-helix",
             "beacon": "polaris-beacon",
-            "nova": "polaris-vanguard",  # Nova lives inside polaris-vanguard
+            "nexus": ["nexus_agent.py"],  # 🚀 Add
+            "nova": "polaris-vanguard",
+            "pulsar": ["pulsar_agent.py"],  # 🚀 Add
+            "radar": ["radar_agent.py"],  # 🚀 Add
             "vanguard": "polaris-vanguard",
         }
 
-        self.repo_name = self.repo_map.get(self.target_agent)
+        self.repo_name = (
+            target_repository or fallback_map.get(base_agent) or f"polaris-{base_agent}"
+        )
 
         # 🎯 WINDOWS SAFE: Dynamically fetches OS-native temp directories
         base_temp = tempfile.gettempdir()
@@ -45,7 +59,6 @@ class ChironGitHandler:
     def clean_sandbox(self) -> None:
         """Removes the local sandbox directory if it already exists."""
         if os.path.exists(self.sandbox_path):
-            # Using onexc for Python 3.12+ / 3.14 compatibility
             shutil.rmtree(self.sandbox_path, onexc=remove_readonly)
 
     def clone_and_branch(self) -> bool:
@@ -59,11 +72,9 @@ class ChironGitHandler:
         self.clean_sandbox()
         os.makedirs(os.path.dirname(self.sandbox_path), exist_ok=True)
 
-        # Authenticate git with the secure GitHub Token
         clone_url = f"https://x-access-token:{self.github_token}@github.com/{self.github_org}/{self.repo_name}.git"
 
         try:
-            # Clone the main branch
             subprocess.run(
                 ["git", "clone", clone_url, self.sandbox_path],
                 check=True,
@@ -71,7 +82,6 @@ class ChironGitHandler:
                 stderr=subprocess.PIPE,
             )
 
-            # Navigate to sandbox and checkout our target branch
             subprocess.run(
                 ["git", "checkout", "-b", self.branch_name],
                 cwd=self.sandbox_path,
@@ -90,10 +100,8 @@ class ChironGitHandler:
     def stage_commit_and_push(self, commit_message: str) -> bool:
         """Stages all code modifications, commits, and pushes them to GitHub."""
         try:
-            # Stage all file changes
             subprocess.run(["git", "add", "."], cwd=self.sandbox_path, check=True)
 
-            # Configure a temporary git user profile for Chiron commits
             subprocess.run(
                 ["git", "config", "user.name", "Chiron Auto-Healer"],
                 cwd=self.sandbox_path,
@@ -105,14 +113,12 @@ class ChironGitHandler:
                 check=True,
             )
 
-            # Commit the changes
             subprocess.run(
                 ["git", "commit", "-m", commit_message],
                 cwd=self.sandbox_path,
                 check=True,
             )
 
-            # Push changes upstream to our isolated branch
             subprocess.run(
                 ["git", "push", "origin", self.branch_name, "--force"],
                 cwd=self.sandbox_path,
@@ -139,7 +145,7 @@ class ChironGitHandler:
             "title": pr_title,
             "body": pr_body,
             "head": self.branch_name,
-            "base": "main",  # Always target your standard production base
+            "base": "main",
         }
 
         async with httpx.AsyncClient() as client:
