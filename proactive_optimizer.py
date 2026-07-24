@@ -219,7 +219,7 @@ async def get_combined_agent_manifest(conn, agent_name: str) -> dict:
     async with conn.cursor() as cur:
         await cur.execute(
             """
-            SELECT target_repository, system_prompt, config
+            SELECT target_repository, purpose, dependencies, critical_paths
             FROM helix_agent_manifests
             WHERE agent_name = %s AND is_active = TRUE;
             """,
@@ -233,8 +233,15 @@ async def get_combined_agent_manifest(conn, agent_name: str) -> dict:
     # Resolve target repository from the first matching row
     target_repo = rows[0][0]
 
-    # Combine directives across all manifest rules for this agent
-    combined_directives = "\n---\n".join([r[1] for r in rows if r[1]])
+    # Combine directives (purpose, dependencies, critical paths) across all active manifests for this agent
+    directives = []
+    for r in rows:
+        purpose, deps, paths = r[1], r[2], r[3]
+        directives.append(
+            f"Purpose: {purpose}\nDependencies: {deps}\nCritical Paths: {paths}"
+        )
+
+    combined_directives = "\n---\n".join(directives)
 
     return {
         "agent_name": agent_name,
