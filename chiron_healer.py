@@ -113,19 +113,27 @@ async def send_telemetry_log(
     log_level: str, message: str, metadata: Optional[dict] = None
 ) -> None:
     """Sends structured telemetry logs back to Helix's centralized log ingestion endpoint."""
-    logs_base_url = os.getenv(
-        "HELIX_API_URL", "https://polaris-helix.onrender.com/"
+    # Read HELIX_API_URL or fall back to the live Helix production URL
+    logs_base_url = (
+        os.getenv("HELIX_API_URL") or "https://polaris-helix.onrender.com"
     ).rstrip("/")
+
     if not logs_base_url:
         print(f"📡 [Chiron Offline Log] {log_level}: {message}")
         return
 
     endpoint = f"{logs_base_url}/api/v1/logs"
+
+    # Capitalize log_level to match LogIngestSchema Literal["INFO", "WARNING", "ERROR", "CRITICAL"]
+    formatted_level = log_level.upper()
+    if formatted_level not in ["INFO", "WARNING", "ERROR", "CRITICAL"]:
+        formatted_level = "INFO"
+
     payload = {
         "agent_name": "chiron",
-        "log_level": log_level,
+        "log_level": formatted_level,
         "message": message,
-        "metadata": metadata or {},
+        "metadata": {"extra_context": metadata or {}} if metadata else None,
     }
 
     try:
