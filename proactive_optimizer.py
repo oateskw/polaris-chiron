@@ -8,9 +8,6 @@ from typing import Optional, Tuple
 from anthropic import AsyncAnthropic
 from config import get_remote_prompt, get_agent_manifest
 
-# Global execution lock to prevent parallel path conflicts
-OPTIMIZER_LOCK = asyncio.Lock()
-
 
 class ChironProactiveOptimizer:
     def __init__(self, sandbox_path: str):
@@ -251,168 +248,167 @@ async def run_proactive_optimization_pipeline(payload, db_pool=None):
     from git_handler import ChironGitHandler
     from chiron_healer import send_telemetry_log, fire_telegram_alert
 
-    if OPTIMIZER_LOCK.locked():
-        print(
-            "📡 [Chiron Gatekeeper] Optimization loop already in progress. Rejecting overlapping request."
-        )
+    timestamp_str = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    branch_name = f"optimization/{payload.target_agent}-{timestamp_str}"
+
+    # 🚀 STEP 1: Fetch aggregated manifest & repository target from DB
+    manifest_data = None
+    target_repo = None
+    combined_prompt = None
+    if db_pool:
+        async with db_pool.connection() as conn:
+            manifest_data = await get_combined_agent_manifest(
+                conn, payload.target_agent
+            )
+            if manifest_data:
+                target_repo = manifest_data.get("target_repository")
+                combined_prompt = manifest_data.get("system_prompt")
+
+    # 🚀 STEP 2: Instantiate Git Handler with resolved target_repository
+    git_handler = ChironGitHandler(
+        target_agent=payload.target_agent,
+        branch_name=branch_name,
+        target_repository=target_repo,
+    )
+    optimizer = ChironProactiveOptimizer(sandbox_path=git_handler.sandbox_path)
+
+    await send_telemetry_log(
+        "INFO",
+        f"Chiron initiating repository-wide crawl optimization for agent: '{payload.target_agent}'",
+    )
+
+    if not git_handler.clone_and_branch():
         return
 
-    async with OPTIMIZER_LOCK:
-        timestamp_str = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        branch_name = f"optimization/{payload.target_agent}-{timestamp_str}"
-
-        # 🚀 STEP 1: Fetch aggregated manifest & repository target from DB
-        manifest_data = None
-        target_repo = None
-        combined_prompt = None
-        if db_pool:
-            async with db_pool.connection() as conn:
-                manifest_data = await get_combined_agent_manifest(
-                    conn, payload.target_agent
+    python_files_found = []
+    for root, _, files in os.walk(git_handler.sandbox_path):
+        if any(
+            ignored in root
+            for ignored in [
+                ".git",
+                "venv",
+                "__pycache__",
+                ".pytest_cache",
+                ".github",
+            ]
+        ):
+            continue
+        for file in files:
+            if file.endswith(".py"):
+                relative_path = os.path.relpath(
+                    os.path.join(root, file), git_handler.sandbox_path
                 )
-                if manifest_data:
-                    target_repo = manifest_data.get("target_repository")
-                    combined_prompt = manifest_data.get("system_prompt")
+                python_files_found.append(relative_path)
 
-        # 🚀 STEP 2: Instantiate Git Handler with resolved target_repository
-        git_handler = ChironGitHandler(
-            target_agent=payload.target_agent,
-            branch_name=branch_name,
-            target_repository=target_repo,  # Eliminates NoneType sandbox crashes!
-        )
-        optimizer = ChironProactiveOptimizer(sandbox_path=git_handler.sandbox_path)
+    # Normalize agent key
+    base_agent = payload.target_agent.lower().split("_")[0]
 
+    TARGET_MODULE_MAP = {
+        "beacon": ["beacon_agent.py"],
+        "nova": ["nova_agent.py"],
+        "vanguard": ["vanguard_core.py"],
+    }
+
+    if base_agent in TARGET_MODULE_MAP:
+        allowed = TARGET_MODULE_MAP[base_agent]
+        filtered = [
+            f
+            for f in python_files_found
+            if any(f.endswith(target) for target in allowed)
+        ]
+        if filtered:
+            python_files_found = filtered
+    else:
+        ignore_list = ["nexus_agent.py", "pulsar_agent.py", "radar_agent.py"]
+        python_files_found = [
+            f
+            for f in python_files_found
+            if not any(f.endswith(ignored) for ignored in ignore_list)
+        ]
+
+    if not python_files_found:
         await send_telemetry_log(
-            "INFO",
-            f"Chiron initiating repository-wide crawl optimization for agent: '{payload.target_agent}'",
+            "WARNING",
+            f"No python source files discovered for agent '{payload.target_agent}'.",
         )
-
-        if not git_handler.clone_and_branch():
-            return
-
-        python_files_found = []
-        for root, _, files in os.walk(git_handler.sandbox_path):
-            if any(
-                ignored in root
-                for ignored in [
-                    ".git",
-                    "venv",
-                    "__pycache__",
-                    ".pytest_cache",
-                    ".github",
-                ]
-            ):
-                continue
-            for file in files:
-                if file.endswith(".py"):
-                    relative_path = os.path.relpath(
-                        os.path.join(root, file), git_handler.sandbox_path
-                    )
-                    python_files_found.append(relative_path)
-
-        # 🚀 STEP 3: Normalize agent key to match base module mapping
-        base_agent = payload.target_agent.lower().split("_")[
-            0
-        ]  # "nova_harvest_optimizer" -> "nova"
-
-        TARGET_MODULE_MAP = {
-            "beacon": ["beacon_agent.py"],
-            "nova": ["nova_agent.py"],
-            "vanguard": ["vanguard_core.py"],
-        }
-
-        if base_agent in TARGET_MODULE_MAP:
-            allowed = TARGET_MODULE_MAP[base_agent]
-            filtered = [
-                f
-                for f in python_files_found
-                if any(f.endswith(target) for target in allowed)
-            ]
-            if filtered:
-                python_files_found = filtered
-        else:
-            # General fallback: skip sister agent modules in shared repositories
-            ignore_list = ["nexus_agent.py", "pulsar_agent.py", "radar_agent.py"]
-            python_files_found = [
-                f
-                for f in python_files_found
-                if not any(f.endswith(ignored) for ignored in ignore_list)
-            ]
-
-        if not python_files_found:
-            await send_telemetry_log(
-                "WARNING",
-                f"No python source files discovered for agent '{payload.target_agent}'.",
-            )
-            git_handler.clean_sandbox()
-            return
-
-        await send_telemetry_log(
-            "INFO",
-            f"Crawler discovered {len(python_files_found)} Python modules to analyze.",
-        )
-        modules_optimized = []
-
-        optimization_spec = getattr(payload, "optimization_specification", None)
-
-        for rel_file_path in python_files_found:
-            original_code = optimizer.read_target_file(rel_file_path)
-            if not original_code:
-                continue
-
-            await send_telemetry_log(
-                "INFO", f"Scanning module architecture footprint: `{rel_file_path}`"
-            )
-
-            optimized_code = await optimizer.generate_optimization(
-                file_path=rel_file_path,
-                original_code=original_code,
-                agent_name=payload.target_agent,
-                focus_area=getattr(payload, "focus_area", "general"),
-                optimization_spec=optimization_spec,
-                combined_manifest_prompt=combined_prompt,
-            )
-
-            if optimized_code and optimized_code != original_code:
-                optimizer.write_patched_file(rel_file_path, optimized_code)
-                modules_optimized.append(rel_file_path)
-
-        if not modules_optimized:
-            await send_telemetry_log(
-                "INFO",
-                "Crawl complete. Fleet code configuration matching optimal target thresholds.",
-            )
-            git_handler.clean_sandbox()
-            return
-
-        commit_msg = f"refactor({payload.target_agent}): comprehensive autonomous codebase optimization suite"
-        if not git_handler.stage_commit_and_push(commit_msg):
-            git_handler.clean_sandbox()
-            return
-
-        file_list_str = "\n".join([f"* `{f}`" for f in modules_optimized])
-        pr_title = f"🚀 [Chiron Base Evolution] Optimized Structural Layout inside `{payload.target_agent}`"
-        pr_body = (
-            f"### 🚀 Chiron Proactive Evolution Report\n\n"
-            f"Chiron executed a top-to-bottom optimization crawl across **{payload.target_agent}** and generated high-impact code refactors.\n\n"
-            f"#### 📦 Refactored System Modules:\n"
-            f"{file_list_str}\n\n"
-            f"#### 🔍 Verification Engine Result:\n"
-            f"* All target modifications successfully resolved local unit test suites inside the sandboxed verification execution block.\n\n"
-            f"_Please complete regression review pipeline checks prior to merge acceptance._"
-        )
-
-        pr_info = await git_handler.open_pull_request(pr_title, pr_body)
-        if pr_info:
-            from watchdog import monitor_production_telemetry
-
-            asyncio.create_task(
-                monitor_production_telemetry(payload.target_agent, pr_info["pr_number"])
-            )
-
-            await fire_telegram_alert(
-                error_context=f"🚀 FLEET OPTIMIZATION MERGE READY: {payload.target_agent.upper()}",
-                message_text=f"Surgically optimized {len(modules_optimized)} codebase modules!\nOpened PR #{pr_info['pr_number']}\n🔗 [View Evolution PR]({pr_info['pr_url']})",
-            )
-
         git_handler.clean_sandbox()
+        return
+
+    await send_telemetry_log(
+        "INFO",
+        f"Crawler discovered {len(python_files_found)} Python modules to analyze.",
+    )
+    modules_optimized = []
+
+    optimization_spec = getattr(payload, "optimization_specification", None)
+
+    for rel_file_path in python_files_found:
+        original_code = optimizer.read_target_file(rel_file_path)
+        if not original_code:
+            continue
+
+        await send_telemetry_log(
+            "INFO", f"Scanning module architecture footprint: `{rel_file_path}`"
+        )
+
+        optimized_code = await optimizer.generate_optimization(
+            file_path=rel_file_path,
+            original_code=original_code,
+            agent_name=payload.target_agent,
+            focus_area=getattr(payload, "focus_area", "general"),
+            optimization_spec=optimization_spec,
+            combined_manifest_prompt=combined_prompt,
+        )
+
+        if optimized_code and optimized_code != original_code:
+            optimizer.write_patched_file(rel_file_path, optimized_code)
+            modules_optimized.append(rel_file_path)
+
+    # 🌟 UPDATED: Notify Telegram when no PR is created!
+    if not modules_optimized:
+        await send_telemetry_log(
+            "INFO",
+            "Crawl complete. Fleet code configuration matching optimal target thresholds.",
+        )
+        await fire_telegram_alert(
+            error_context=f"ℹ️ OPTIMIZATION AUDIT COMPLETE: {payload.target_agent.upper()}",
+            message_text=(
+                f"Chiron scanned codebase modules for `{payload.target_agent}`.\n\n"
+                f"• Result: Code structure matches optimal target thresholds.\n"
+                f"• Next: No PR required. Bottlenecks are operational or data-driven."
+            ),
+        )
+        git_handler.clean_sandbox()
+        return
+
+    commit_msg = f"refactor({payload.target_agent}): comprehensive autonomous codebase optimization suite"
+    if not git_handler.stage_commit_and_push(commit_msg):
+        git_handler.clean_sandbox()
+        return
+
+    file_list_str = "\n".join([f"* `{f}`" for f in modules_optimized])
+    pr_title = f"🚀 [Chiron Base Evolution] Optimized Structural Layout inside `{payload.target_agent}`"
+    pr_body = (
+        f"### 🚀 Chiron Proactive Evolution Report\n\n"
+        f"Chiron executed a top-to-bottom optimization crawl across **{payload.target_agent}** and generated high-impact code refactors.\n\n"
+        f"#### 📦 Refactored System Modules:\n"
+        f"{file_list_str}\n\n"
+        f"#### 🔍 Verification Engine Result:\n"
+        f"* All target modifications successfully resolved local unit test suites inside the sandboxed verification execution block.\n\n"
+        f"_Please complete regression review pipeline checks prior to merge acceptance._"
+    )
+
+    pr_info = await git_handler.open_pull_request(pr_title, pr_body)
+    if pr_info:
+        from watchdog import monitor_production_telemetry
+
+        asyncio.create_task(
+            monitor_production_telemetry(payload.target_agent, pr_info["pr_number"])
+        )
+
+        await fire_telegram_alert(
+            error_context=f"🚀 FLEET OPTIMIZATION MERGE READY: {payload.target_agent.upper()}",
+            message_text=f"Surgically optimized {len(modules_optimized)} codebase modules!\nOpened PR #{pr_info['pr_number']}\n🔗 [View Evolution PR]({pr_info['pr_url']})",
+        )
+
+    git_handler.clean_sandbox()

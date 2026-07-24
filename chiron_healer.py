@@ -1,14 +1,14 @@
+import asyncio
 import os
 import hmac
 import datetime
 import psycopg
 import httpx
-from typing import Any, Optional
+from typing import Any, Optional, Set
 from fastapi import FastAPI, HTTPException, Header, BackgroundTasks
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-# Import custom Chiron modules
 from git_handler import ChironGitHandler
 from patch_generator import ChironPatchGenerator
 from proactive_optimizer import run_proactive_optimization_pipeline
@@ -16,6 +16,43 @@ from proactive_optimizer import run_proactive_optimization_pipeline
 load_dotenv()
 
 app = FastAPI(title="Polaris Chiron GitOps Healing Agent")
+
+# ------------------------------------------------------------------
+# 🌟 Async Queue & Deduplication State
+# ------------------------------------------------------------------
+optimization_queue: asyncio.Queue = asyncio.Queue()
+queued_agents: Set[str] = set()
+worker_task: Optional[asyncio.Task] = None
+
+
+async def chiron_optimization_worker():
+    """
+    Background worker that sequentially pulls optimization requests
+    from the queue and executes run_proactive_optimization_pipeline.
+    """
+    while True:
+        payload = await optimization_queue.get()
+        agent_name = payload.target_agent.lower().strip()
+
+        try:
+            print(
+                f"📡 [Chiron Queue Worker] Processing optimization for agent: '{payload.target_agent}'"
+            )
+            await run_proactive_optimization_pipeline(payload)
+        except Exception as e:
+            print(
+                f"⚠️ [Chiron Queue Worker] Exception during '{payload.target_agent}' run: {e}"
+            )
+        finally:
+            queued_agents.discard(agent_name)
+            optimization_queue.task_done()
+
+
+@app.on_event("startup")
+async def startup_chiron_worker():
+    """Launches the queue worker task on server startup."""
+    global worker_task
+    worker_task = asyncio.create_task(chiron_optimization_worker())
 
 
 class HealingTriggerSchema(BaseModel):
@@ -379,7 +416,6 @@ async def trigger_healing(
 @app.post("/api/v1/chiron/optimize")
 async def trigger_optimization(
     payload: OptimizationTriggerSchema,
-    background_tasks: BackgroundTasks,
     x_chiron_key: Optional[str] = Header(default=None),
 ):
     expected_key = os.getenv("HELIX_AUTH_TOKEN")
@@ -389,8 +425,21 @@ async def trigger_optimization(
     if not hmac.compare_digest(x_chiron_key, expected_key):
         raise HTTPException(status_code=401, detail="Unauthorized handshake signature")
 
-    background_tasks.add_task(run_proactive_optimization_pipeline, payload)
+    agent_key = payload.target_agent.lower().strip()
+
+    # Prevent duplicate enqueuing if the agent is already waiting or running
+    if agent_key in queued_agents:
+        return {
+            "status": "optimization_analysis_already_queued",
+            "target_agent": payload.target_agent,
+            "message": f"Optimization for agent '{payload.target_agent}' is already queued or in progress.",
+        }
+
+    queued_agents.add(agent_key)
+    await optimization_queue.put(payload)
+
     return {
-        "status": "optimization_analysis_scheduled",
+        "status": "optimization_analysis_queued",
         "target_agent": payload.target_agent,
+        "queue_position": optimization_queue.qsize(),
     }
