@@ -113,7 +113,9 @@ async def send_telemetry_log(
     log_level: str, message: str, metadata: Optional[dict] = None
 ) -> None:
     """Sends structured telemetry logs back to Helix's centralized log ingestion endpoint."""
-    logs_base_url = os.getenv("HELIX_API_URL", "").rstrip("/")
+    logs_base_url = os.getenv(
+        "HELIX_API_URL", "https://polaris-helix.onrender.com/"
+    ).rstrip("/")
     if not logs_base_url:
         print(f"📡 [Chiron Offline Log] {log_level}: {message}")
         return
