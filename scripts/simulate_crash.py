@@ -8,7 +8,7 @@ load_dotenv()
 HELIX_API_URL = os.getenv("HELIX_API_URL", "https://polaris-helix.onrender.com").rstrip(
     "/"
 )
-HELIX_AUTH_TOKEN = os.getenv("HELIX_AUTH_TOKEN", "wipdu7-vuzcyC-decrez")
+HELIX_AUTH_TOKEN = os.getenv("HELIX_AUTH_TOKEN", "")
 
 # Constructing a realistic traceback pointing to a file in your beacon repo
 mock_traceback = """
@@ -27,12 +27,15 @@ payload = {
 }
 
 headers = {
-    "X-Inbound-Key": HELIX_AUTH_TOKEN,  # Standardized key validation
+    "X-Helix-Auth-Token": HELIX_AUTH_TOKEN,
     "Content-Type": "application/json",
 }
 
 
 def trigger_simulation():
+    if not HELIX_AUTH_TOKEN:
+        raise RuntimeError("HELIX_AUTH_TOKEN is required to run the crash simulation")
+
     print(f"📡 Sending mock crash log to Helix at: {HELIX_API_URL}/api/v1/logs")
     try:
         response = requests.post(

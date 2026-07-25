@@ -129,16 +129,29 @@ async def send_telemetry_log(
     if formatted_level not in ["INFO", "WARNING", "ERROR", "CRITICAL"]:
         formatted_level = "INFO"
 
+    metadata_values = dict(metadata or {})
+    traceback_text = metadata_values.pop("traceback", None)
+    if formatted_level == "ERROR" and not traceback_text:
+        formatted_level = "WARNING"
+
     payload = {
         "agent_name": "chiron",
         "log_level": formatted_level,
         "message": message,
-        "metadata": {"extra_context": metadata or {}} if metadata else None,
+        "metadata": (
+            {"traceback": traceback_text, "extra_context": metadata_values}
+            if traceback_text or metadata_values
+            else None
+        ),
     }
 
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.post(endpoint, json=payload)
+            response = await client.post(
+                endpoint,
+                headers={"X-Helix-Auth-Token": os.getenv("HELIX_AUTH_TOKEN", "")},
+                json=payload,
+            )
             if response.status_code != 200:
                 print(
                     f"⚠️ [Chiron Log] Helix rejected telemetry log: {response.status_code} - {response.text}"
