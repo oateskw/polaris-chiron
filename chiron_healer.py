@@ -4,6 +4,7 @@ import hmac
 import datetime
 import psycopg
 import httpx
+from psycopg import sql
 from typing import Any, Optional, Set
 from fastapi import FastAPI, HTTPException, Header, BackgroundTasks
 from pydantic import BaseModel
@@ -25,6 +26,30 @@ queued_agents: Set[str] = set()
 worker_task: Optional[asyncio.Task] = None
 
 
+async def update_manifest_optimization_status(agent_name: str, status: str) -> None:
+    db_url = os.getenv("DATABASE_URL", "")
+    if not db_url:
+        print(
+            f"⚠️ [Chiron Status] DATABASE_URL missing; could not mark {agent_name} as {status}."
+        )
+        return
+
+    try:
+        async with await psycopg.AsyncConnection.connect(db_url) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE helix_agent_manifests
+                    SET optimization_status = %s
+                    WHERE LOWER(agent_name) = %s;
+                    """,
+                    (status, agent_name.lower().strip()),
+                )
+            await conn.commit()
+    except Exception as exc:
+        print(f"⚠️ [Chiron Status] Could not mark {agent_name} as {status}: {exc}")
+
+
 async def chiron_optimization_worker():
     """
     Background worker that sequentially pulls optimization requests
@@ -35,11 +60,14 @@ async def chiron_optimization_worker():
         agent_name = payload.target_agent.lower().strip()
 
         try:
+            await update_manifest_optimization_status(agent_name, "RUNNING")
             print(
                 f"📡 [Chiron Queue Worker] Processing optimization for agent: '{payload.target_agent}'"
             )
             await run_proactive_optimization_pipeline(payload)
+            await update_manifest_optimization_status(agent_name, "COMPLETED")
         except Exception as e:
+            await update_manifest_optimization_status(agent_name, "FAILED")
             print(
                 f"⚠️ [Chiron Queue Worker] Exception during '{payload.target_agent}' run: {e}"
             )
@@ -169,12 +197,15 @@ async def update_session_db(
         print("⚠️ DATABASE_URL not set. Skipping session DB update.")
         return
 
-    set_clause = "status = %s, updated_at = NOW()"
+    assignments: list[sql.Composable] = [
+        sql.SQL("status = %s"),
+        sql.SQL("updated_at = NOW()"),
+    ]
     params: list[Any] = [status]
 
     if extra_fields:
         for key, value in extra_fields.items():
-            set_clause += f", {key} = %s"
+            assignments.append(sql.SQL("{} = %s").format(sql.Identifier(key)))
             params.append(value)
 
     params.append(session_id)
@@ -183,7 +214,9 @@ async def update_session_db(
         async with await psycopg.AsyncConnection.connect(db_url) as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    f"UPDATE chiron_healing_sessions SET {set_clause} WHERE id = %s;",
+                    sql.SQL(
+                        "UPDATE chiron_healing_sessions SET {} WHERE id = %s;"
+                    ).format(sql.SQL(", ").join(assignments)),
                     params,
                 )
             await conn.commit()
@@ -427,6 +460,12 @@ async def trigger_healing(
                 detail=f"Failed to record session initiation state: {db_err}",
             )
 
+    if session_id is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to obtain the healing session ID.",
+        )
+
     background_tasks.add_task(run_healing_pipeline, payload, session_id)
 
     return {
@@ -458,6 +497,7 @@ async def trigger_optimization(
             "message": f"Optimization for agent '{payload.target_agent}' is already queued or in progress.",
         }
 
+    await update_manifest_optimization_status(agent_key, "QUEUED")
     queued_agents.add(agent_key)
     await optimization_queue.put(payload)
 

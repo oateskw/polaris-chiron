@@ -1,4 +1,6 @@
 import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import chiron_healer
 
@@ -65,3 +67,29 @@ def test_chiron_preserves_error_with_python_traceback(monkeypatch):
 
     assert captured["json"]["log_level"] == "ERROR"
     assert captured["json"]["metadata"]["traceback"] == python_traceback
+
+
+def test_optimization_worker_tracks_running_and_completed(monkeypatch):
+    payload = SimpleNamespace(target_agent="Pulsar")
+    queue = AsyncMock()
+    queue.get.side_effect = [payload, asyncio.CancelledError()]
+    queue.task_done = MagicMock()
+    status_update = AsyncMock()
+    pipeline = AsyncMock()
+    monkeypatch.setattr(chiron_healer, "optimization_queue", queue)
+    monkeypatch.setattr(
+        chiron_healer, "update_manifest_optimization_status", status_update
+    )
+    monkeypatch.setattr(chiron_healer, "run_proactive_optimization_pipeline", pipeline)
+
+    async def run_worker_once():
+        try:
+            await chiron_healer.chiron_optimization_worker()
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(run_worker_once())
+
+    assert status_update.await_args_list[0].args == ("pulsar", "RUNNING")
+    assert status_update.await_args_list[1].args == ("pulsar", "COMPLETED")
+    queue.task_done.assert_called_once()
