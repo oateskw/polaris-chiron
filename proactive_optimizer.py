@@ -215,11 +215,11 @@ class ChironProactiveOptimizer:
 
 
 async def get_combined_agent_manifest(conn, agent_name: str) -> dict:
-    """Aggregates all active manifest rows for a target agent into a single execution context."""
+    """Aggregates active manifest rows and target files for a target agent."""
     async with conn.cursor() as cur:
         await cur.execute(
             """
-            SELECT target_repository, purpose, dependencies, critical_paths
+            SELECT target_repository, purpose, dependencies, critical_paths, target_files
             FROM helix_agent_manifests
             WHERE agent_name = %s AND is_active = TRUE;
             """,
@@ -230,16 +230,19 @@ async def get_combined_agent_manifest(conn, agent_name: str) -> dict:
     if not rows:
         return None
 
-    # Resolve target repository from the first matching row
     target_repo = rows[0][0]
 
-    # Combine directives (purpose, dependencies, critical paths) across all active manifests for this agent
+    # Collect and flatten all specified target files across active manifests
+    specified_target_files = []
     directives = []
+
     for r in rows:
-        purpose, deps, paths = r[1], r[2], r[3]
+        purpose, deps, paths, files = r[1], r[2], r[3], r[4]
         directives.append(
             f"Purpose: {purpose}\nDependencies: {deps}\nCritical Paths: {paths}"
         )
+        if files:
+            specified_target_files.extend(files)
 
     combined_directives = "\n---\n".join(directives)
 
@@ -247,6 +250,7 @@ async def get_combined_agent_manifest(conn, agent_name: str) -> dict:
         "agent_name": agent_name,
         "target_repository": target_repo,
         "system_prompt": combined_directives,
+        "target_files": list(set(specified_target_files)),  # Deduplicate
     }
 
 
@@ -307,31 +311,28 @@ async def run_proactive_optimization_pipeline(payload, db_pool=None):
                 )
                 python_files_found.append(relative_path)
 
-    # Normalize agent key
-    base_agent = payload.target_agent.lower().split("_")[0]
+    # 🚀 STEP 3: Smart File Discovery (DB Manifest -> Dynamic Match -> Fallback)
+    manifest_target_files = (
+        manifest_data.get("target_files", []) if manifest_data else []
+    )
 
-    TARGET_MODULE_MAP = {
-        "beacon": ["beacon_agent.py"],
-        "nova": ["nova_agent.py"],
-        "vanguard": ["vanguard_core.py"],
-    }
-
-    if base_agent in TARGET_MODULE_MAP:
-        allowed = TARGET_MODULE_MAP[base_agent]
-        filtered = [
+    if manifest_target_files:
+        # 1. Exact match against database manifest specifications
+        matched = [
             f
             for f in python_files_found
-            if any(f.endswith(target) for target in allowed)
+            if any(f.endswith(target.strip()) for target in manifest_target_files)
         ]
-        if filtered:
-            python_files_found = filtered
+        if matched:
+            python_files_found = matched
     else:
-        ignore_list = ["nexus_agent.py", "pulsar_agent.py", "radar_agent.py"]
-        python_files_found = [
-            f
-            for f in python_files_found
-            if not any(f.endswith(ignored) for ignored in ignore_list)
+        # 2. Dynamic fallback matching if manifest has no specified files
+        base_agent = payload.target_agent.lower().strip()
+        matched = [
+            f for f in python_files_found if base_agent in os.path.basename(f).lower()
         ]
+        if matched:
+            python_files_found = matched
 
     if not python_files_found:
         await send_telemetry_log(
