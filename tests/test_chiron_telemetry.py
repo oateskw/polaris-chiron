@@ -38,9 +38,7 @@ def test_chiron_downgrades_untraced_error_and_authenticates(monkeypatch):
     install_http_client(monkeypatch, captured)
 
     asyncio.run(
-        chiron_healer.send_telemetry_log(
-            "ERROR", "Git clone failed", {"session_id": 7}
-        )
+        chiron_healer.send_telemetry_log("ERROR", "Git clone failed", {"session_id": 7})
     )
 
     assert captured["headers"]["X-Helix-Auth-Token"] == "test-token"
@@ -51,7 +49,7 @@ def test_chiron_downgrades_untraced_error_and_authenticates(monkeypatch):
 def test_chiron_preserves_error_with_python_traceback(monkeypatch):
     captured = {}
     python_traceback = (
-        'Traceback (most recent call last):\n'
+        "Traceback (most recent call last):\n"
         '  File "/app/chiron_healer.py", line 42, in run\n'
         "ValueError: failed"
     )
