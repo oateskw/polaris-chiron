@@ -7,6 +7,7 @@ import subprocess
 from typing import Optional, Tuple
 from anthropic import AsyncAnthropic
 from config import get_remote_prompt, get_agent_manifest
+import vendor_health
 
 
 class ChironProactiveOptimizer:
@@ -143,6 +144,10 @@ class ChironProactiveOptimizer:
                 user_content += f"\n\n⚠️ CRITICAL: YOUR MODIFICATIONS BROKE THE UNIT TESTS:\n{test_failures}\nRewrite your SEARCH/REPLACE blocks safely to avoid breaking behavior."
 
             try:
+                if not await vendor_health.is_vendor_circuit_healthy():
+                    print("🛑 [Chiron Proactive] Anthropic circuit is unavailable.")
+                    return None
+
                 response = await self.client.messages.create(
                     model=self.model,
                     max_tokens=2000,

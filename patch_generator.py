@@ -4,6 +4,7 @@ import subprocess
 from typing import Optional, Tuple
 from anthropic import AsyncAnthropic
 from config import get_remote_prompt, get_agent_manifest
+import vendor_health
 
 
 class ChironPatchGenerator:
@@ -130,6 +131,10 @@ class ChironPatchGenerator:
                 user_content += f"\n\n⚠️ YOUR PREVIOUS PATCH FAILED TESTS WITH THIS ERROR:\n{test_failures}\nAdjust your fix to satisfy the test requirements."
 
             try:
+                if not await vendor_health.is_vendor_circuit_healthy():
+                    print("🛑 [Chiron Patch] Anthropic circuit is unavailable.")
+                    return None
+
                 response = await self.client.messages.create(
                     model=self.model,
                     max_tokens=600,
