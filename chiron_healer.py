@@ -103,8 +103,25 @@ class OptimizationTriggerSchema(BaseModel):
 
 async def fire_telegram_alert(error_context: str, message_text: str) -> None:
     """🚨 Sends a live notification alert to the configured Telegram channel."""
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    direct_send_enabled = (
+        os.getenv("TELEGRAM_DIRECT_SEND_ENABLED", "false").strip().lower() == "true"
+    )
+    critical_only = (
+        os.getenv("TELEGRAM_DIRECT_CRITICAL_ONLY", "true").strip().lower() == "true"
+    )
+    normalized_payload = f"{error_context} {message_text}".lower()
+    is_critical = any(
+        marker in normalized_payload
+        for marker in ("critical", "error", "failed", "exception", "traceback", "🚨")
+    )
+
+    if not direct_send_enabled and not (critical_only and is_critical):
+        return
+
+    bot_token = os.getenv("TELEGRAM_CRITICAL_BOT_TOKEN") or os.getenv(
+        "TELEGRAM_BOT_TOKEN"
+    )
+    chat_id = os.getenv("TELEGRAM_CRITICAL_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
 
     if not bot_token or not chat_id:
         print("⚠️ [Chiron Telegram] Alert skipped: Credentials missing in environment.")
