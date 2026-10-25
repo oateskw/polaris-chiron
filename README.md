@@ -45,14 +45,14 @@ In both cases Claude proposes the change as `SEARCH/REPLACE` blocks, Chiron appl
 ### Optimize
 
 1. Helix posts `target_agent` and, optionally, `optimization_specification` (free text), `focus_area`, and context fields.
-2. Chiron queues the request (one at a time, one per agent) and answers with its queue position. A worker marks the agent's manifest `QUEUED` -> `RUNNING` -> `COMPLETED` or `FAILED`.
+2. Chiron stores the request as a row in `chiron_jobs` (one open job per agent) and answers with the job ID and queue position. A worker takes jobs one at a time and marks the agent's manifest `QUEUED` -> `RUNNING` -> `COMPLETED` or `FAILED`. A job that runs longer than `CHIRON_RUN_CAP_MINUTES` (default 30) is failed.
 3. It clones the repository, lists every `.py` file (skipping `.git`, `venv`, `__pycache__`, `.pytest_cache`, `.github`), and narrows the list to files whose name contains the agent name, or to the manifest's `target_files` when set.
 4. For each file, Claude gets the full source, the agent's manifest, the focus area, and the audit directive, and returns `SEARCH/REPLACE` blocks. Chiron applies them, runs `pytest`, and retries once with the failure output.
-5. If any module changed, it commits, force-pushes the branch, opens a PR, starts the 30-minute watchdog, and sends a Telegram alert. If nothing changed, it only sends an "audit complete, no PR" alert.
+5. If any module changed, it commits, force-pushes the branch, opens a PR, records the PR URL on the agent's manifest and the job, and sends a Telegram alert. If nothing changed, it only sends an "audit complete, no PR" alert.
 
 ### After a PR is opened
 
-A watchdog polls Helix's `GET /api/v1/telemetry/errors-count?agent=<name>` every 60 seconds for 30 minutes. If the agent's error count rises by more than 5 over the starting count, Chiron logs a `CRITICAL` event to Helix and sends a Telegram alert. It does not roll anything back. Note that the window starts when the PR is opened, not when it is merged.
+`watchdog.py` is no longer started after a PR (it lived in memory and could not survive a sleep on Render's free tier); GitHub review is the gate. The code is kept for a future durable version. It polls Helix's `GET /api/v1/telemetry/errors-count?agent=<name>` every 60 seconds for 30 minutes. If the agent's error count rises by more than 5 over the starting count, Chiron logs a `CRITICAL` event to Helix and sends a Telegram alert. It does not roll anything back. Note that the window starts when the PR is opened, not when it is merged.
 
 ## HTTP API
 
@@ -101,7 +101,7 @@ Responses:
 - `{"status": "optimization_analysis_queued", "target_agent": "nova", "queue_position": 1}`
 - `{"status": "optimization_analysis_already_queued", ...}` if that agent is already waiting or running (HTTP 200 both times).
 
-There are no health, status or approval routes. The queue and the dedupe set live in memory, so a restart empties them.
+`GET` or `HEAD /` returns a small status object; Chiron calls it on itself while a job runs. There are no status or approval routes. Jobs are stored in Postgres, so a restart does not lose them.
 
 ## How Helix uses Chiron
 
@@ -159,6 +159,8 @@ Set these as environment variables (or in a git-ignored `.env`).
 | `DATABASE_URL` | yes | none | Same Postgres database as Helix. |
 | `ANTHROPIC_API_KEY` | yes | none | Without it no patch can be generated. |
 | `ANTHROPIC_MODEL` | no | `claude-3-5-sonnet-latest` | Model for patches. Set a current model ID explicitly. |
+| `CHIRON_RUN_CAP_MINUTES` | no | `30` | Longest an optimize job may run before it is failed. |
+| `RENDER_EXTERNAL_URL` | no | set by Render | Public URL Chiron requests while a job runs, to stay awake. |
 | `GITHUB_TOKEN` | yes | none | Clone, push, and open PRs. |
 | `GITHUB_ORG_OR_USER` | yes | none | Owner of the repositories (for example `oateskw`). |
 | `HELIX_API_URL` | no | `https://polaris-helix.onrender.com` | Where logs, the error-count query and the circuit check go. |
@@ -186,7 +188,10 @@ Helix's `init_db.py` creates a minimal version of the manifest and sessions tabl
 - **Start command:** `uvicorn chiron_healer:app --host 0.0.0.0 --port $PORT`
 - **Environment:** the variables above. Set `PYTHON_VERSION` to a full version such as `3.12.8`.
 - The service needs `git` (present on Render's Python runtime) and clones into the OS temp directory.
-- On a free instance the service sleeps when idle. The optimize queue and the 30-minute watchdog are in memory, so a sleep or restart drops queued work and any running watchdog. Helix wakes Chiron when it calls it, but a request received just before a sleep is not retried.
+- **Free instance behavior.** The service sleeps after about 15 minutes with no inbound request and takes about a minute to wake. Do not put a pinger on Chiron: free instance hours are shared, and Helix's pinger already uses most of them. Helix wakes Chiron by calling it.
+- **Jobs survive sleep.** Optimize jobs are rows in `chiron_jobs` (created by Helix's `python init_db.py`). On startup Chiron re-queues any job left `running` by a killed process, and fails a job that has already been tried twice. The worker waits for a wake-up signal instead of polling the database, so an idle Chiron lets the database sleep too.
+- **Stays awake while working.** While a job runs, Chiron requests its own public URL (`RENDER_EXTERNAL_URL`, which Render sets) every 5 minutes so it is not put to sleep mid-clone. It stops when the job ends.
+- Blocking work (git, pytest) runs in a thread so those requests are still answered.
 - Each agent's tests run with the dependencies installed in *Chiron's* environment. If an agent's tests import a package Chiron does not have, its tests fail and no PR is opened.
 
 ## Testing
@@ -196,7 +201,7 @@ pip install -r requirements.txt
 pytest
 ```
 
-Current tests cover telemetry and queue status tracking (`tests/test_chiron_telemetry.py`) and the vendor circuit check (`tests/test_vendor_circuit.py`). There are no tests for the git handler, patch application or the two pipelines.
+Current tests cover telemetry (`tests/test_chiron_telemetry.py`), the vendor circuit check (`tests/test_vendor_circuit.py`), brief assembly and the repo map (`tests/test_optimizer_fixes.py`), and the durable queue, run cap, keep-awake and `/optimize` route (`tests/test_job_queue.py`). There are no tests for the git handler, patch application or the two pipelines.
 
 `scripts/simulate_crash.py` posts a fake `ZeroDivisionError` for the `beacon` agent to Helix. **Against production this triggers a real heal run and a real PR on `polaris-beacon`.** Point `HELIX_API_URL` at a test instance, or close the PR afterwards.
 
@@ -206,7 +211,7 @@ Fixed in the latest commit: the Linux test gate (`shell=True` removed, timeout r
 
 Still open:
 
-1. **In-memory state.** The queue, the dedupe set and the watchdog are lost on restart or sleep.
+1. **No post-PR watchdog.** It was in memory and is no longer started. A durable version would need to run on a schedule, which the free tier does not offer.
 2. **Force-push.** Branch names include a timestamp, so collisions are unlikely, but pushes use `--force`.
 3. **Pinned, older dependencies.** `anthropic==0.28.0` and `fastapi==0.111.0` are pinned in `requirements.txt`, and `@app.on_event("startup")` is deprecated in current FastAPI.
 4. **Missing prompts.** If the `helix_agent_prompts` rows for Chiron are missing, Chiron skips patching. Helix's `python init_db.py` loads them from `seed_data/`.

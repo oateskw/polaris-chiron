@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException, Header, BackgroundTasks
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
+import job_queue
 from git_handler import ChironGitHandler
 from patch_generator import ChironPatchGenerator
 from proactive_optimizer import run_proactive_optimization_pipeline
@@ -18,11 +19,8 @@ load_dotenv()
 
 app = FastAPI(title="Polaris Chiron GitOps Healing Agent")
 
-# ------------------------------------------------------------------
-# 🌟 Async Queue & Deduplication State
-# ------------------------------------------------------------------
-optimization_queue: asyncio.Queue = asyncio.Queue()
-queued_agents: Set[str] = set()
+# Optimization jobs are stored in Postgres (job_queue.py), not in memory, so a sleep or
+# restart on Render's free tier cannot lose them.
 worker_task: Optional[asyncio.Task] = None
 
 
@@ -50,37 +48,29 @@ async def update_manifest_optimization_status(agent_name: str, status: str) -> N
         print(f"⚠️ [Chiron Status] Could not mark {agent_name} as {status}: {exc}")
 
 
-async def chiron_optimization_worker():
-    """
-    Background worker that sequentially pulls optimization requests
-    from the queue and executes run_proactive_optimization_pipeline.
-    """
-    while True:
-        payload = await optimization_queue.get()
-        agent_name = payload.target_agent.lower().strip()
-
-        try:
-            await update_manifest_optimization_status(agent_name, "RUNNING")
-            print(
-                f"📡 [Chiron Queue Worker] Processing optimization for agent: '{payload.target_agent}'"
-            )
-            await run_proactive_optimization_pipeline(payload)
-            await update_manifest_optimization_status(agent_name, "COMPLETED")
-        except Exception as e:
-            await update_manifest_optimization_status(agent_name, "FAILED")
-            print(
-                f"⚠️ [Chiron Queue Worker] Exception during '{payload.target_agent}' run: {e}"
-            )
-        finally:
-            queued_agents.discard(agent_name)
-            optimization_queue.task_done()
+async def run_optimization_job(job_payload: dict) -> Optional[dict]:
+    """Runs one stored optimization request through the proactive pipeline."""
+    payload = OptimizationTriggerSchema(**job_payload)
+    print(
+        f"📡 [Chiron Queue Worker] Processing optimization for agent: '{payload.target_agent}'"
+    )
+    return await run_proactive_optimization_pipeline(payload)
 
 
 @app.on_event("startup")
 async def startup_chiron_worker():
-    """Launches the queue worker task on server startup."""
+    """Launches the durable queue worker on server startup."""
     global worker_task
-    worker_task = asyncio.create_task(chiron_optimization_worker())
+    worker_task = asyncio.create_task(
+        job_queue.worker_loop(run_optimization_job, update_manifest_optimization_status)
+    )
+
+
+@app.head("/")
+@app.get("/")
+async def heartbeat():
+    """Cheap target for the keep-awake request and for uptime checks."""
+    return {"status": "ok", "service": "chiron"}
 
 
 class HealingTriggerSchema(BaseModel):
@@ -506,8 +496,14 @@ async def trigger_optimization(
 
     agent_key = payload.target_agent.lower().strip()
 
-    # Prevent duplicate enqueuing if the agent is already waiting or running
-    if agent_key in queued_agents:
+    try:
+        job_id = await job_queue.enqueue_job(payload.model_dump())
+    except Exception as exc:
+        print(f"⚠️ [Chiron Queue] Could not store optimization job: {exc}")
+        raise HTTPException(status_code=503, detail="Job queue unavailable")
+
+    # The database allows one open job per agent, so None means a duplicate.
+    if job_id is None:
         return {
             "status": "optimization_analysis_already_queued",
             "target_agent": payload.target_agent,
@@ -515,11 +511,11 @@ async def trigger_optimization(
         }
 
     await update_manifest_optimization_status(agent_key, "QUEUED")
-    queued_agents.add(agent_key)
-    await optimization_queue.put(payload)
+    job_queue.wake()
 
     return {
         "status": "optimization_analysis_queued",
         "target_agent": payload.target_agent,
-        "queue_position": optimization_queue.qsize(),
+        "job_id": job_id,
+        "queue_position": await job_queue.queue_position(job_id),
     }

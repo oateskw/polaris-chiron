@@ -168,7 +168,9 @@ class ChironProactiveOptimizer:
 
                 self.write_patched_file(file_path, optimized_code)
 
-                tests_passed, test_log = self.run_sandbox_tests()
+                tests_passed, test_log = await asyncio.to_thread(
+                    self.run_sandbox_tests
+                )
                 if tests_passed:
                     return optimized_code
 
@@ -342,8 +344,8 @@ async def run_proactive_optimization_pipeline(payload, db_pool=None):
         f"Chiron initiating repository-wide crawl optimization for agent: '{payload.target_agent}'",
     )
 
-    if not git_handler.clone_and_branch():
-        return
+    if not await asyncio.to_thread(git_handler.clone_and_branch):
+        return {"outcome": "failed", "error": "Could not clone the repository"}
 
     python_files_found = []
     for root, _, files in os.walk(git_handler.sandbox_path):
@@ -409,7 +411,7 @@ async def run_proactive_optimization_pipeline(payload, db_pool=None):
             f"No python source files discovered for agent '{payload.target_agent}'.",
         )
         git_handler.clean_sandbox()
-        return
+        return {"outcome": "no_changes"}
 
     await send_telemetry_log(
         "INFO",
@@ -456,12 +458,12 @@ async def run_proactive_optimization_pipeline(payload, db_pool=None):
             ),
         )
         git_handler.clean_sandbox()
-        return
+        return {"outcome": "no_changes"}
 
     commit_msg = f"refactor({payload.target_agent}): comprehensive autonomous codebase optimization suite"
-    if not git_handler.stage_commit_and_push(commit_msg):
+    if not await asyncio.to_thread(git_handler.stage_commit_and_push, commit_msg):
         git_handler.clean_sandbox()
-        return
+        return {"outcome": "failed", "error": "Could not push the branch"}
 
     file_list_str = "\n".join([f"* `{f}`" for f in modules_optimized])
     pr_title = f"🚀 [Chiron Base Evolution] Optimized Structural Layout inside `{payload.target_agent}`"
@@ -477,13 +479,9 @@ async def run_proactive_optimization_pipeline(payload, db_pool=None):
 
     pr_info = await git_handler.open_pull_request(pr_title, pr_body)
     if pr_info:
-        from watchdog import monitor_production_telemetry
-
+        # The in-memory post-PR watchdog is not started: it cannot survive a sleep on
+        # Render's free tier. GitHub review of the PR is the gate.
         await record_optimization_pr(payload.target_agent, pr_info["pr_url"])
-
-        asyncio.create_task(
-            monitor_production_telemetry(payload.target_agent, pr_info["pr_number"])
-        )
 
         await fire_telegram_alert(
             error_context=f"🚀 FLEET OPTIMIZATION MERGE READY: {payload.target_agent.upper()}",
@@ -491,3 +489,6 @@ async def run_proactive_optimization_pipeline(payload, db_pool=None):
         )
 
     git_handler.clean_sandbox()
+    if pr_info:
+        return {"outcome": "pr_opened", "pr_url": pr_info["pr_url"]}
+    return {"outcome": "failed", "error": "Changes pushed but the pull request was not opened"}
