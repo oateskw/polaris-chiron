@@ -433,7 +433,7 @@ async def trigger_healing(
     if not expected_key or not x_chiron_key:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    if not hmac.compare_digest(x_chiron_key, expected_key):
+    if not hmac.compare_digest(x_chiron_key.encode(), expected_key.encode()):
         raise HTTPException(status_code=401, detail="Unauthorized handshake signature")
 
     db_url = os.getenv("DATABASE_URL", "")
@@ -501,7 +501,7 @@ async def trigger_optimization(
     if not expected_key or not x_chiron_key:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    if not hmac.compare_digest(x_chiron_key, expected_key):
+    if not hmac.compare_digest(x_chiron_key.encode(), expected_key.encode()):
         raise HTTPException(status_code=401, detail="Unauthorized handshake signature")
 
     agent_key = payload.target_agent.lower().strip()

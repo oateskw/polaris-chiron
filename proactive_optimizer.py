@@ -4,6 +4,7 @@ import sys
 import re
 import datetime
 import subprocess
+import psycopg
 from typing import Optional, Tuple
 from anthropic import AsyncAnthropic
 from config import get_remote_prompt, get_agent_manifest
@@ -59,8 +60,7 @@ class ChironProactiveOptimizer:
                 env=env_override,
                 capture_output=True,
                 text=True,
-                timeout=30.0,
-                shell=True,
+                timeout=120.0,
             )
 
             if result.returncode in [0, 5]:
@@ -259,6 +259,45 @@ async def get_combined_agent_manifest(conn, agent_name: str) -> dict:
     }
 
 
+async def record_optimization_pr(agent_name: str, pr_url: str) -> None:
+    """Stores the latest optimization PR on the manifest row. Never raises."""
+    db_url = os.getenv("DATABASE_URL", "")
+    if not db_url:
+        return
+    try:
+        async with await psycopg.AsyncConnection.connect(db_url) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE helix_agent_manifests
+                    SET last_optimization_pr_url = %s, last_optimized_at = NOW()
+                    WHERE LOWER(agent_name) = %s;
+                    """,
+                    (pr_url, agent_name.lower().strip()),
+                )
+            await conn.commit()
+    except Exception as exc:
+        print(f"⚠️ [Chiron Proactive] Could not record PR URL: {exc}")
+
+
+def build_optimization_brief(payload) -> Optional[str]:
+    """Folds every field of an optimize request into one brief for the model."""
+    parts = []
+    spec = getattr(payload, "optimization_specification", None)
+    if spec:
+        parts.append(spec)
+    reason = getattr(payload, "reason", None)
+    if reason:
+        parts.append(f"Reason for this request: {reason}")
+    issues = getattr(payload, "issues_detected", None)
+    if issues:
+        parts.append("Issues detected:" + chr(10) + chr(10).join(f"- {i}" for i in issues))
+    metrics = getattr(payload, "metrics_context", None)
+    if metrics:
+        parts.append(f"Metrics context: {metrics}")
+    return (chr(10) * 2).join(parts) or None
+
+
 async def run_proactive_optimization_pipeline(payload, db_pool=None):
     """🧠 CHIRON PROACTIVE CRAWLER ENGINE (Sequential Module Evolution)"""
     from git_handler import ChironGitHandler
@@ -271,14 +310,24 @@ async def run_proactive_optimization_pipeline(payload, db_pool=None):
     manifest_data = None
     target_repo = None
     combined_prompt = None
-    if db_pool:
-        async with db_pool.connection() as conn:
-            manifest_data = await get_combined_agent_manifest(
-                conn, payload.target_agent
-            )
-            if manifest_data:
-                target_repo = manifest_data.get("target_repository")
-                combined_prompt = manifest_data.get("system_prompt")
+    try:
+        if db_pool:
+            async with db_pool.connection() as conn:
+                manifest_data = await get_combined_agent_manifest(
+                    conn, payload.target_agent
+                )
+        elif os.getenv("DATABASE_URL"):
+            async with await psycopg.AsyncConnection.connect(
+                os.environ["DATABASE_URL"]
+            ) as conn:
+                manifest_data = await get_combined_agent_manifest(
+                    conn, payload.target_agent
+                )
+    except Exception as exc:
+        print(f"⚠️ [Chiron Proactive] Manifest lookup failed, using defaults: {exc}")
+    if manifest_data:
+        target_repo = manifest_data.get("target_repository")
+        combined_prompt = manifest_data.get("system_prompt")
 
     # 🚀 STEP 2: Instantiate Git Handler with resolved target_repository
     git_handler = ChironGitHandler(
@@ -320,8 +369,23 @@ async def run_proactive_optimization_pipeline(payload, db_pool=None):
     manifest_target_files = (
         manifest_data.get("target_files", []) if manifest_data else []
     )
+    requested_file = (getattr(payload, "target_file", None) or "").strip()
 
-    if manifest_target_files:
+    if requested_file:
+        # An explicit file in the request wins over the manifest.
+        matched = [f for f in python_files_found if f.endswith(requested_file)]
+        if matched:
+            python_files_found = matched
+        else:
+            await send_telemetry_log(
+                "WARNING",
+                f"Requested target_file '{requested_file}' not found; using manifest discovery.",
+            )
+            requested_file = ""
+
+    if requested_file:
+        pass
+    elif manifest_target_files:
         # 1. Exact match against database manifest specifications
         matched = [
             f
@@ -353,7 +417,7 @@ async def run_proactive_optimization_pipeline(payload, db_pool=None):
     )
     modules_optimized = []
 
-    optimization_spec = getattr(payload, "optimization_specification", None)
+    optimization_spec = build_optimization_brief(payload)
 
     for rel_file_path in python_files_found:
         original_code = optimizer.read_target_file(rel_file_path)
@@ -414,6 +478,8 @@ async def run_proactive_optimization_pipeline(payload, db_pool=None):
     pr_info = await git_handler.open_pull_request(pr_title, pr_body)
     if pr_info:
         from watchdog import monitor_production_telemetry
+
+        await record_optimization_pr(payload.target_agent, pr_info["pr_url"])
 
         asyncio.create_task(
             monitor_production_telemetry(payload.target_agent, pr_info["pr_number"])

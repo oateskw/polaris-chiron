@@ -36,14 +36,18 @@ class ChironGitHandler:
             0
         ]  # "nova_harvest_optimizer" -> "nova"
 
+        # Used only when the manifest has no target_repository. Nexus, Radar and
+        # Pulsar live inside the polaris-beacon repo; Nova inside polaris-vanguard.
         fallback_map = {
             "helix": "polaris-helix",
             "beacon": "polaris-beacon",
-            "nexus": ["nexus_agent.py"],  # 🚀 Add
+            "nexus": "polaris-beacon",
             "nova": "polaris-vanguard",
-            "pulsar": ["pulsar_agent.py"],  # 🚀 Add
-            "radar": ["radar_agent.py"],  # 🚀 Add
+            "pulsar": "polaris-beacon",
+            "radar": "polaris-beacon",
             "vanguard": "polaris-vanguard",
+            "vector": "polaris-vector",
+            "aura": "polaris-aura",
         }
 
         self.repo_name = (
